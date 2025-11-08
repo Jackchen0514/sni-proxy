@@ -1,0 +1,82 @@
+# Rust 编译输出
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo 锁文件（库项目应该忽略，二进制项目应该提交）
+# 如果是库项目，取消下面这行的注释
+# Cargo.lock
+
+# 编译生成的可执行文件
+/sni-proxy
+/debug/
+/release/
+
+# Rust 相关
+*.rlib
+*.rmeta
+*.so
+*.dylib
+*.dll
+*.exe
+
+# 测试和基准测试输出
+/criterion/
+/target/criterion/
+
+# IDE 和编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+.DS_Store
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+*.pid
+*.seed
+*.out
+
+# 操作系统
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# 配置文件（可选）
+# 如果不想提交本地配置，取消下面的注释
+# config.local.json
+# .env
+# .env.local
+
+# 文档生成
+/doc/
+
+# 覆盖率报告
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# Flamegraph
+flamegraph.svg
+perf.data
+perf.data.old
+
+# 其他
+.cache/
+node_modules/

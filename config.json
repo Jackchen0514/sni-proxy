@@ -1,0 +1,11 @@
+{
+  "listen_addr": "0.0.0.0:8443",
+  "whitelist": [
+    "www.example.com",
+    "api.example.com",
+    "github.com",
+    "www.google.com",
+    "www.rust-lang.org",
+    "docs.rs"
+  ]
+}

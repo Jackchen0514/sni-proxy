@@ -1,0 +1,7 @@
+[build]
+# 强制使用 Docker，即使目标平台与主机不匹配
+force-non-host = true
+
+[target.x86_64-unknown-linux-musl]
+# 可以指定特定的 Docker 镜像（可选）
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:latest"
