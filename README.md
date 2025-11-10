@@ -58,10 +58,10 @@ cargo run --release
 ```json
 {
   "listen_addr": "0.0.0.0:8443",
+  "max_connections": 10000,
   "whitelist": [
-    "www.example.com",
-    "api.example.com",
-    "github.com"
+    "example.com",
+    "*.example.com"
   ]
 }
 ```
