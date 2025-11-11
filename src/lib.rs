@@ -8,6 +8,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+/// SOCKS5 代理配置
+#[derive(Debug, Clone)]
+pub struct Socks5Config {
+    /// SOCKS5 代理服务器地址
+    pub addr: SocketAddr,
+    /// 用户名（可选）
+    pub username: Option<String>,
+    /// 密码（可选）
+    pub password: Option<String>,
+}
+
 /// 域名匹配器，支持精确匹配和通配符匹配
 #[derive(Debug, Clone)]
 pub struct DomainMatcher {
@@ -83,6 +94,8 @@ pub struct SniProxy {
     domain_matcher: Arc<DomainMatcher>,
     /// 最大并发连接数
     max_connections: usize,
+    /// SOCKS5 代理配置（可选）
+    socks5_config: Option<Arc<Socks5Config>>,
 }
 
 impl SniProxy {
@@ -94,12 +107,19 @@ impl SniProxy {
             listen_addr,
             domain_matcher: Arc::new(domain_matcher),
             max_connections: 10000, // 默认最大并发连接数
+            socks5_config: None,
         }
     }
 
     /// 设置最大并发连接数
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
+        self
+    }
+
+    /// 设置 SOCKS5 代理
+    pub fn with_socks5(mut self, socks5_config: Socks5Config) -> Self {
+        self.socks5_config = Some(Arc::new(socks5_config));
         self
     }
 
@@ -112,6 +132,15 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
+        if let Some(socks5) = &self.socks5_config {
+            info!("使用 SOCKS5 出口: {}", socks5.addr);
+            if socks5.username.is_some() {
+                info!("SOCKS5 认证: 启用");
+            }
+        } else {
+            info!("直接连接到目标服务器（未配置 SOCKS5）");
+        }
+
         // 使用信号量限制并发连接数
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
 
@@ -123,12 +152,13 @@ impl SniProxy {
                 Ok((client_stream, client_addr)) => {
                     debug!("接受来自 {} 的新连接", client_addr);
                     let domain_matcher = Arc::clone(&self.domain_matcher);
+                    let socks5_config = self.socks5_config.clone();
 
                     tokio::spawn(async move {
                         // 持有许可直到连接处理完成
                         let _permit = permit;
 
-                        if let Err(e) = handle_connection(client_stream, domain_matcher).await {
+                        if let Err(e) = handle_connection(client_stream, domain_matcher, socks5_config).await {
                             debug!("处理连接时出错: {}", e);
                         }
                     });
@@ -147,6 +177,7 @@ impl SniProxy {
 async fn handle_connection(
     mut client_stream: TcpStream,
     domain_matcher: Arc<DomainMatcher>,
+    socks5_config: Option<Arc<Socks5Config>>,
 ) -> Result<()> {
     // 设置 TCP KeepAlive
     let _ = client_stream.set_nodelay(true);
@@ -193,27 +224,41 @@ async fn handle_connection(
 
     info!("域名 {} 匹配白名单，建立代理连接", sni);
 
-    // 连接到目标服务器（带超时和重试）
-    let target_addr = format!("{}:443", sni);
-    let mut target_stream = match timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(&target_addr)
-    ).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            error!("连接到目标服务器 {} 失败: {}", target_addr, e);
-            return Ok(());
+    // 连接到目标服务器
+    let target_stream = if let Some(socks5) = socks5_config {
+        // 通过 SOCKS5 连接
+        info!("通过 SOCKS5 连接到 {}:443", sni);
+        match connect_via_socks5(&sni, 443, socks5.as_ref()).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("通过 SOCKS5 连接到 {}:443 失败: {}", sni, e);
+                return Ok(());
+            }
         }
-        Err(_) => {
-            error!("连接到目标服务器 {} 超时", target_addr);
-            return Ok(());
+    } else {
+        // 直接连接
+        let target_addr = format!("{}:443", sni);
+        match timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(&target_addr)
+        ).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                error!("连接到目标服务器 {} 失败: {}", target_addr, e);
+                return Ok(());
+            }
+            Err(_) => {
+                error!("连接到目标服务器 {} 超时", target_addr);
+                return Ok(());
+            }
         }
     };
 
     // 设置目标连接的 TCP 选项
+    let mut target_stream = target_stream;
     let _ = target_stream.set_nodelay(true);
 
-    debug!("成功连接到目标服务器 {}", target_addr);
+    debug!("成功连接到目标服务器 {}:443", sni);
 
     // 转发 Client Hello
     if let Err(e) = target_stream.write_all(&buffer).await {
@@ -228,6 +273,175 @@ async fn handle_connection(
 
     debug!("连接关闭: {}", sni);
     Ok(())
+}
+
+/// 通过 SOCKS5 代理连接到目标主机
+async fn connect_via_socks5(
+    target_host: &str,
+    target_port: u16,
+    socks5_config: &Socks5Config,
+) -> Result<TcpStream> {
+    // 连接到 SOCKS5 代理服务器
+    let mut socks5_stream = match timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(&socks5_config.addr),
+    )
+        .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!("无法连接到 SOCKS5 服务器 {}: {}", socks5_config.addr, e));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "连接到 SOCKS5 服务器 {} 超时",
+                socks5_config.addr
+            ));
+        }
+    };
+
+    let _ = socks5_stream.set_nodelay(true);
+
+    // 发送 SOCKS5 握手包
+    let auth_method = if socks5_config.username.is_some() && socks5_config.password.is_some() {
+        0x02 // 用户名/密码认证
+    } else {
+        0x00 // 无认证
+    };
+
+    let hello_packet = [0x05, 0x01, auth_method]; // SOCKS5, 1 method, auth method
+    socks5_stream.write_all(&hello_packet).await?;
+
+    // 读取服务器响应
+    let mut response = [0u8; 2];
+    socks5_stream.read_exact(&mut response).await?;
+
+    if response[0] != 0x05 {
+        return Err(anyhow::anyhow!("SOCKS5 服务器版本不正确"));
+    }
+
+    let selected_method = response[1];
+
+    // 处理认证
+    if selected_method == 0x02 {
+        // 用户名/密码认证
+        if let (Some(username), Some(password)) = (&socks5_config.username, &socks5_config.password) {
+            let mut auth_packet = vec![0x01]; // 认证版本
+
+            // 添加用户名
+            if username.len() > 255 {
+                return Err(anyhow::anyhow!("用户名太长"));
+            }
+            auth_packet.push(username.len() as u8);
+            auth_packet.extend_from_slice(username.as_bytes());
+
+            // 添加密码
+            if password.len() > 255 {
+                return Err(anyhow::anyhow!("密码太长"));
+            }
+            auth_packet.push(password.len() as u8);
+            auth_packet.extend_from_slice(password.as_bytes());
+
+            socks5_stream.write_all(&auth_packet).await?;
+
+            // 读取认证响应
+            let mut auth_response = [0u8; 2];
+            socks5_stream.read_exact(&mut auth_response).await?;
+
+            if auth_response[1] != 0x00 {
+                return Err(anyhow::anyhow!("SOCKS5 认证失败"));
+            }
+        } else {
+            return Err(anyhow::anyhow!("SOCKS5 需要认证但未提供凭证"));
+        }
+    } else if selected_method == 0xFF {
+        return Err(anyhow::anyhow!("SOCKS5 服务器不支持任何认证方法"));
+    }
+
+    // 发送连接请求
+    let mut connect_packet = vec![
+        0x05, // SOCKS5
+        0x01, // CONNECT
+        0x00, // 保留
+    ];
+
+    // 地址类型和地址
+    if let Ok(ip) = target_host.parse::<std::net::IpAddr>() {
+        // IP 地址
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                connect_packet.push(0x01); // IPv4
+                connect_packet.extend_from_slice(&ipv4.octets());
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                connect_packet.push(0x04); // IPv6
+                connect_packet.extend_from_slice(&ipv6.octets());
+            }
+        }
+    } else {
+        // 域名
+        if target_host.len() > 255 {
+            return Err(anyhow::anyhow!("域名太长"));
+        }
+        connect_packet.push(0x03); // 域名
+        connect_packet.push(target_host.len() as u8);
+        connect_packet.extend_from_slice(target_host.as_bytes());
+    }
+
+    // 端口（大端字节序）
+    connect_packet.extend_from_slice(&target_port.to_be_bytes());
+
+    socks5_stream.write_all(&connect_packet).await?;
+
+    // 读取连接响应
+    let mut resp_header = [0u8; 4];
+    socks5_stream.read_exact(&mut resp_header).await?;
+
+    if resp_header[0] != 0x05 {
+        return Err(anyhow::anyhow!("SOCKS5 响应版本不正确"));
+    }
+
+    if resp_header[1] != 0x00 {
+        let error_msg = match resp_header[1] {
+            0x01 => "一般 SOCKS 服务器错误",
+            0x02 => "连接不允许（规则）",
+            0x03 => "网络不可达",
+            0x04 => "主机不可达",
+            0x05 => "连接被拒绝",
+            0x06 => "TTL 超时",
+            0x07 => "不支持的命令",
+            0x08 => "不支持的地址类型",
+            _ => "未知错误",
+        };
+        return Err(anyhow::anyhow!("SOCKS5 连接失败: {}", error_msg));
+    }
+
+    // 读取绑定地址信息（根据地址类型）
+    match resp_header[3] {
+        0x01 => {
+            // IPv4
+            let mut addr_buf = [0u8; 6]; // 4 bytes IPv4 + 2 bytes port
+            socks5_stream.read_exact(&mut addr_buf).await?;
+        }
+        0x03 => {
+            // 域名
+            let mut len_buf = [0u8; 1];
+            socks5_stream.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            let mut addr_buf = vec![0u8; len + 2]; // domain + 2 bytes port
+            socks5_stream.read_exact(&mut addr_buf).await?;
+        }
+        0x04 => {
+            // IPv6
+            let mut addr_buf = [0u8; 18]; // 16 bytes IPv6 + 2 bytes port
+            socks5_stream.read_exact(&mut addr_buf).await?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!("不支持的地址类型"));
+        }
+    }
+
+    Ok(socks5_stream)
 }
 
 /// 双向代理数据传输（优化版本）

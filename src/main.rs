@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sni_proxy::SniProxy;
+use sni_proxy::{SniProxy, Socks5Config};
 use std::fs;
 use std::net::SocketAddr;
 
@@ -8,6 +8,18 @@ use std::net::SocketAddr;
 struct Config {
     listen_addr: String,
     whitelist: Vec<String>,
+    /// SOCKS5 代理配置（可选）
+    socks5: Option<Socks5ConfigFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Socks5ConfigFile {
+    /// SOCKS5 代理服务器地址，格式：ip:port 或 domain:port
+    addr: String,
+    /// 用户名（可选）
+    username: Option<String>,
+    /// 密码（可选）
+    password: Option<String>,
 }
 
 #[tokio::main]
@@ -41,8 +53,39 @@ async fn main() -> Result<()> {
         log::info!("  [{}] {}", i + 1, domain);
     }
 
-    // 创建并启动代理
-    let proxy = SniProxy::new(listen_addr, config.whitelist);
+    // 创建代理实例
+    let mut proxy = SniProxy::new(listen_addr, config.whitelist);
+
+    // 配置 SOCKS5（如果提供）
+    if let Some(socks5_config_file) = config.socks5 {
+        log::info!("配置 SOCKS5 代理");
+
+        // 解析 SOCKS5 地址
+        let socks5_addr: SocketAddr = socks5_config_file
+            .addr
+            .parse()
+            .context("无效的 SOCKS5 代理地址")?;
+
+        log::info!("SOCKS5 代理服务器: {}", socks5_addr);
+
+        if socks5_config_file.username.is_some() {
+            log::info!("SOCKS5 认证方式: 用户名/密码");
+        } else {
+            log::info!("SOCKS5 认证方式: 无认证");
+        }
+
+        let socks5_config = Socks5Config {
+            addr: socks5_addr,
+            username: socks5_config_file.username,
+            password: socks5_config_file.password,
+        };
+
+        proxy = proxy.with_socks5(socks5_config);
+    } else {
+        log::info!("未配置 SOCKS5，使用直接连接");
+    }
+
+    // 启动代理
     proxy.run().await?;
 
     Ok(())

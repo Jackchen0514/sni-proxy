@@ -1,0 +1,154 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Linux ARM64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            name: linux-arm64
+            cross: true
+            archive: tar.gz
+
+          # macOS ARM64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: macos-arm64
+            cross: false
+            archive: tar.gz
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-24.04
+            name: windows-x64
+            cross: true
+            archive: zip
+
+          # Linux x86_64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            name: linux-x64
+            cross: false
+            archive: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux)
+        if: runner.os == 'Linux' && matrix.cross
+        run: |
+          sudo apt-get update
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+          fi
+
+      - name: Install musl-tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+            export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+          fi
+          cargo build --target ${{ matrix.target }} --release
+        shell: bash
+
+      - name: Get binary name
+        id: binary
+        run: |
+          # 从 Cargo.toml 获取项目名称
+          BINARY_NAME=$(grep "^name" Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "name=$BINARY_NAME" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Package release assets
+        run: |
+          mkdir -p release
+          cd target/${{ matrix.target }}/release
+          
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            # Windows
+            7z a ../../../release/${{ steps.binary.outputs.name }}-${{ matrix.name }}.zip ${{ steps.binary.outputs.name }}.exe
+          else
+            # Unix systems
+            tar czf ../../../release/${{ steps.binary.outputs.name }}-${{ matrix.name }}.tar.gz ${{ steps.binary.outputs.name }}
+          fi
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.binary.outputs.name }}-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Download
+            
+            Download the appropriate file for your platform:
+            - **Linux ARM64**: `*-linux-arm64.tar.gz`
+            - **Linux x64**: `*-linux-x64.tar.gz`
+            - **macOS ARM64**: `*-macos-arm64.tar.gz`
+            - **Windows x64**: `*-windows-x64.zip`
+            
+            Verify checksums using `SHA256SUMS`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
