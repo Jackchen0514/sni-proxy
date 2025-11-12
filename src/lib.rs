@@ -174,6 +174,7 @@ impl SniProxy {
 }
 
 /// 处理单个客户端连接
+/// ⚡ 优化版本: 更快的超时和更大的缓冲区
 async fn handle_connection(
     mut client_stream: TcpStream,
     domain_matcher: Arc<DomainMatcher>,
@@ -182,10 +183,11 @@ async fn handle_connection(
     // 设置 TCP KeepAlive
     let _ = client_stream.set_nodelay(true);
 
-    // 读取 TLS Client Hello（带超时）
-    let mut buffer = vec![0u8; 8192]; // 增加缓冲区大小
+    // ⚡ 优化：增加缓冲区到 64KB（从 16KB）
+    let mut buffer = vec![0u8; 65536];
 
-    let n = match timeout(Duration::from_secs(10), client_stream.read(&mut buffer)).await {
+    // ⚡ 优化：降低超时到 3 秒（从 10 秒）
+    let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
@@ -238,8 +240,9 @@ async fn handle_connection(
     } else {
         // 直接连接
         let target_addr = format!("{}:443", sni);
+        // ⚡ 优化：降低超时到 3 秒
         match timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(3),
             TcpStream::connect(&target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
@@ -276,17 +279,18 @@ async fn handle_connection(
 }
 
 /// 通过 SOCKS5 代理连接到目标主机
+/// ⚡ 优化版本: 更快的超时
 async fn connect_via_socks5(
     target_host: &str,
     target_port: u16,
     socks5_config: &Socks5Config,
 ) -> Result<TcpStream> {
-    // 连接到 SOCKS5 代理服务器
+    // ⚡ 优化：降低超时到 3 秒
     let mut socks5_stream = match timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(3),
         TcpStream::connect(&socks5_config.addr),
     )
-        .await
+    .await
     {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
@@ -445,6 +449,7 @@ async fn connect_via_socks5(
 }
 
 /// 双向代理数据传输（优化版本）
+/// ⚡ 优化：更大的缓冲区提高吞吐量
 async fn proxy_data(
     client_stream: TcpStream,
     target_stream: TcpStream,
@@ -452,9 +457,9 @@ async fn proxy_data(
     let (mut client_read, mut client_write) = client_stream.into_split();
     let (mut target_read, mut target_write) = target_stream.into_split();
 
-    // 使用更大的缓冲区提高性能
+    // ⚡ 优化：使用 64KB 缓冲区（从 16KB）以提高吞吐量
     let client_to_target = async {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = match client_read.read(&mut buf).await {
                 Ok(0) => return Ok::<(), std::io::Error>(()),
@@ -466,7 +471,7 @@ async fn proxy_data(
     };
 
     let target_to_client = async {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = match target_read.read(&mut buf).await {
                 Ok(0) => return Ok::<(), std::io::Error>(()),
