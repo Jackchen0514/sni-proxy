@@ -55,6 +55,7 @@ cargo run --release
 
 1. 创建或编辑 `config.json`:
 
+不带代理的
 ```json
 {
   "listen_addr": "0.0.0.0:8443",
@@ -63,6 +64,23 @@ cargo run --release
     "example.com",
     "*.example.com"
   ]
+}
+```
+
+含代理的(可包含密码)
+```
+{
+  "listen_addr": "0.0.0.0:8443",
+  "max_connections": 10000,
+  "whitelist": [
+    "example.com",
+    "*.example.com"
+  ],
+  "socks5": {
+    "addr": "127.0.0.1:1080",
+    "username": null,
+    "password": null
+  }
 }
 ```
 
