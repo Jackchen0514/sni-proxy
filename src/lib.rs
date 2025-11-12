@@ -187,7 +187,7 @@ async fn handle_connection(
     let mut buffer = vec![0u8; 65536];
 
     // ⚡ 优化：降低超时到 3 秒（从 10 秒）
-    let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
+    let n = match timeout(Duration::from_millis(500), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
