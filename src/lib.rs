@@ -216,9 +216,46 @@ impl SniProxy {
 
     /// 启动代理服务器
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.listen_addr)
-            .await
+        // 创建 socket 并设置选项
+        let std_listener = std::net::TcpListener::bind(self.listen_addr)
             .context("绑定监听地址失败")?;
+
+        // ⚡ 优化：设置 socket 选项
+        std_listener.set_nonblocking(true)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                let fd = std_listener.as_raw_fd();
+                // SO_REUSEADDR - 允许地址重用
+                let reuse: libc::c_int = 1;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &reuse as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&reuse) as libc::socklen_t,
+                );
+
+                // SO_REUSEPORT - 允许端口重用（Linux/macOS）
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    const SO_REUSEPORT: libc::c_int = 15;
+                    let reuse_port: libc::c_int = 1;
+                    let _ = libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        SO_REUSEPORT,
+                        &reuse_port as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&reuse_port) as libc::socklen_t,
+                    );
+                }
+            }
+        }
+
+        // 转换为 Tokio 的 TcpListener
+        let listener = TcpListener::from_std(std_listener)?;
 
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
@@ -249,12 +286,36 @@ impl SniProxy {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
 
         loop {
-            // 获取连接许可
-            let permit = semaphore.clone().acquire_owned().await?;
+            use std::time::Instant;
 
+            // ⏱️ 测量 accept 耗时
+            let accept_start = Instant::now();
             match listener.accept().await {
                 Ok((client_stream, client_addr)) => {
-                    debug!("接受来自 {} 的新连接", client_addr);
+                    let accept_elapsed = accept_start.elapsed();
+
+                    // ⏱️ 测量获取 permit 耗时
+                    let permit_start = Instant::now();
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("获取连接许可失败: {}", e);
+                            continue;
+                        }
+                    };
+                    let permit_elapsed = permit_start.elapsed();
+
+                    // 只在慢的时候打印警告
+                    if accept_elapsed.as_millis() > 100 {
+                        warn!("⏱️  接受连接慢: {}ms (来自 {})", accept_elapsed.as_millis(), client_addr);
+                    }
+                    if permit_elapsed.as_millis() > 10 {
+                        debug!("⏱️  等待许可: {}ms", permit_elapsed.as_millis());
+                    }
+
+                    debug!("接受来自 {} 的新连接 (accept: {:?}, permit: {:?})",
+                           client_addr, accept_elapsed, permit_elapsed);
+
                     let domain_matcher = Arc::clone(&self.domain_matcher);
                     let socks5_config = self.socks5_config.clone();
 
