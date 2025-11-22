@@ -223,6 +223,19 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
+        // ⚡ 预热：预解析热门域名的 DNS（仅用于直连模式）
+        if self.socks5_config.is_none() {
+            info!("预热 DNS 缓存...");
+            let common_domains = vec!["claude.ai", "www.netflix.com", "api.anthropic.com"];
+            for domain in common_domains {
+                if let Err(e) = resolve_host_cached(domain).await {
+                    debug!("预热 DNS 失败 {}: {}", domain, e);
+                } else {
+                    debug!("预热 DNS 成功: {}", domain);
+                }
+            }
+        }
+
         if let Some(socks5) = &self.socks5_config {
             info!("使用 SOCKS5 出口: {}", socks5.addr);
             if socks5.username.is_some() {
@@ -271,6 +284,9 @@ async fn handle_connection(
     domain_matcher: Arc<DomainMatcher>,
     socks5_config: Option<Arc<Socks5Config>>,
 ) -> Result<()> {
+    use std::time::Instant;
+    let start_time = Instant::now();
+
     // 设置 TCP KeepAlive
     let _ = client_stream.set_nodelay(true);
 
@@ -278,6 +294,7 @@ async fn handle_connection(
     let mut buffer = vec![0u8; 65536];
 
     // ⚡ 优化：读取 Client Hello 超时设置为 3 秒
+    let read_start = Instant::now();
     let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
@@ -296,6 +313,7 @@ async fn handle_connection(
     }
 
     buffer.truncate(n);
+    debug!("⏱️  读取 Client Hello 耗时: {:?}", read_start.elapsed());
 
     // 解析 SNI
     let sni = match parse_sni(&buffer) {
@@ -318,13 +336,17 @@ async fn handle_connection(
     info!("域名 {} 匹配白名单，建立代理连接", sni);
 
     // 连接到目标服务器
+    let connect_start = Instant::now();
     let target_stream = if let Some(socks5) = socks5_config {
         // 通过 SOCKS5 连接
         info!("通过 SOCKS5 连接到 {}:443", sni);
         match connect_via_socks5_with_cache(&sni, 443, socks5.as_ref()).await {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                info!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
+                stream
+            },
             Err(e) => {
-                error!("通过 SOCKS5 连接到 {}:443 失败: {}", sni, e);
+                error!("通过 SOCKS5 连接到 {}:443 失败: {} (耗时 {:?})", sni, e, connect_start.elapsed());
                 return Ok(());
             }
         }
@@ -361,11 +383,16 @@ async fn handle_connection(
     }
 
     // 双向转发数据
+    let proxy_start = Instant::now();
     if let Err(e) = proxy_data(client_stream, target_stream).await {
         debug!("数据转发结束: {}", e);
     }
 
-    debug!("连接关闭: {}", sni);
+    info!("⏱️  {} 总耗时: {:?} (连接: {:?}, 转发: {:?})",
+          sni,
+          start_time.elapsed(),
+          connect_start.elapsed(),
+          proxy_start.elapsed());
     Ok(())
 }
 
@@ -402,6 +429,29 @@ pub async fn connect_via_socks5_with_cache(
     };
 
     let _ = socks5_stream.set_nodelay(true);
+
+    // ⚡ 优化：设置 socket 选项以提升性能
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = socks5_stream.as_raw_fd();
+        unsafe {
+            // 设置 TCP_QUICKACK（Linux）- 快速 ACK
+            #[cfg(target_os = "linux")]
+            {
+                const TCP_QUICKACK: libc::c_int = 12;
+                let quickack: libc::c_int = 1;
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    TCP_QUICKACK,
+                    &quickack as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&quickack) as libc::socklen_t,
+                );
+            }
+        }
+    }
+
     debug!("已连接到 SOCKS5 服务器: {}", socks5_config.addr);
 
     // ============ 步骤 3: SOCKS5 握手 - 版本识别请求 ============
