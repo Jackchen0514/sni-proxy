@@ -217,42 +217,45 @@ impl SniProxy {
     /// 启动代理服务器
     pub async fn run(&self) -> Result<()> {
         // 创建 socket 并设置选项
-        let std_listener = std::net::TcpListener::bind(self.listen_addr)
-            .context("绑定监听地址失败")?;
+        use socket2::{Socket, Domain, Type, Protocol};
+
+        // 手动创建 socket 以设置更大的 backlog
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
 
         // ⚡ 优化：设置 socket 选项
-        std_listener.set_nonblocking(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
 
-        #[cfg(unix)]
+        // SO_REUSEPORT - 允许端口重用（Linux/macOS）
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::io::AsRawFd;
             unsafe {
-                let fd = std_listener.as_raw_fd();
-                // SO_REUSEADDR - 允许地址重用
-                let reuse: libc::c_int = 1;
+                let fd = socket.as_raw_fd();
+                const SO_REUSEPORT: libc::c_int = 15;
+                let reuse_port: libc::c_int = 1;
                 let _ = libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
-                    libc::SO_REUSEADDR,
-                    &reuse as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&reuse) as libc::socklen_t,
+                    SO_REUSEPORT,
+                    &reuse_port as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&reuse_port) as libc::socklen_t,
                 );
-
-                // SO_REUSEPORT - 允许端口重用（Linux/macOS）
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                {
-                    const SO_REUSEPORT: libc::c_int = 15;
-                    let reuse_port: libc::c_int = 1;
-                    let _ = libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        SO_REUSEPORT,
-                        &reuse_port as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&reuse_port) as libc::socklen_t,
-                    );
-                }
             }
         }
+
+        // 绑定地址
+        let address = self.listen_addr.into();
+        socket.bind(&address)?;
+
+        // ⚡ 关键优化：设置大的 backlog（默认 128 → 4096）
+        // 这样可以让更多连接在队列中等待，避免 accept 慢
+        socket.listen(4096)?;
+
+        info!("✅ TCP backlog 设置为 4096（提升高并发性能）");
+
+        // 转换为标准库的 TcpListener
+        let std_listener: std::net::TcpListener = socket.into();
 
         // 转换为 Tokio 的 TcpListener
         let listener = TcpListener::from_std(std_listener)?;
