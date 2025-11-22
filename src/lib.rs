@@ -11,7 +11,7 @@ use lru::LruCache;
 use lazy_static::lazy_static;
 use std::num::NonZeroUsize;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 // ======================== DNS 缓存 ========================
 
@@ -24,7 +24,7 @@ lazy_static! {
 pub async fn resolve_host_cached(host: &str) -> Result<Vec<IpAddr>> {
     // 1. 检查缓存
     {
-        let mut cache = DNS_CACHE.lock().unwrap();
+        let mut cache = DNS_CACHE.lock().await;
         if let Some(ips) = cache.get(host) {
             debug!("DNS 缓存命中: {} -> {:?}", host, ips);
             return Ok(ips.clone());
@@ -45,7 +45,7 @@ pub async fn resolve_host_cached(host: &str) -> Result<Vec<IpAddr>> {
 
     // 3. 缓存结果
     {
-        let mut cache = DNS_CACHE.lock().unwrap();
+        let mut cache = DNS_CACHE.lock().await;
         cache.put(host.to_string(), ips.clone());
         debug!("DNS 缓存写入: {} -> {:?}", host, ips);
     }
@@ -54,15 +54,15 @@ pub async fn resolve_host_cached(host: &str) -> Result<Vec<IpAddr>> {
 }
 
 /// 清除 DNS 缓存（可选）
-pub fn clear_dns_cache() {
-    let mut cache = DNS_CACHE.lock().unwrap();
+pub async fn clear_dns_cache() {
+    let mut cache = DNS_CACHE.lock().await;
     cache.clear();
     info!("DNS 缓存已清除");
 }
 
 /// 获取缓存大小（用于监控）
-pub fn get_dns_cache_size() -> usize {
-    let cache = DNS_CACHE.lock().unwrap();
+pub async fn get_dns_cache_size() -> usize {
+    let cache = DNS_CACHE.lock().await;
     cache.len()
 }
 
@@ -277,8 +277,8 @@ async fn handle_connection(
     // ⚡ 优化：增加缓冲区到 64KB（从 16KB）
     let mut buffer = vec![0u8; 65536];
 
-    // ⚡ 优化：降低超时到 3 秒（从 10 秒）
-    let n = match timeout(Duration::from_millis(500), client_stream.read(&mut buffer)).await {
+    // ⚡ 优化：读取 Client Hello 超时设置为 3 秒
+    let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
@@ -325,16 +325,15 @@ async fn handle_connection(
             Ok(stream) => stream,
             Err(e) => {
                 error!("通过 SOCKS5 连接到 {}:443 失败: {}", sni, e);
-                clear_dns_cache();
                 return Ok(());
             }
         }
     } else {
         // 直接连接
         let target_addr = format!("{}:443", sni);
-        // ⚡ 优化：降低超时到 3 秒
+        // ⚡ 优化：连接超时设置为 5 秒
         match timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             TcpStream::connect(&target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
@@ -370,179 +369,9 @@ async fn handle_connection(
     Ok(())
 }
 
-/// 通过 SOCKS5 代理连接到目标主机
-/// ⚡ 优化版本: 更快的超时
-async fn connect_via_socks5(
-    target_host: &str,
-    target_port: u16,
-    socks5_config: &Socks5Config,
-) -> Result<TcpStream> {
-    // ⚡ 优化：降低超时到 3 秒
-    let mut socks5_stream = match timeout(
-        Duration::from_secs(3),
-        TcpStream::connect(&socks5_config.addr),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            return Err(anyhow::anyhow!("无法连接到 SOCKS5 服务器 {}: {}", socks5_config.addr, e));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "连接到 SOCKS5 服务器 {} 超时",
-                socks5_config.addr
-            ));
-        }
-    };
-
-    let _ = socks5_stream.set_nodelay(true);
-
-    // 发送 SOCKS5 握手包
-    let auth_method = if socks5_config.username.is_some() && socks5_config.password.is_some() {
-        0x02 // 用户名/密码认证
-    } else {
-        0x00 // 无认证
-    };
-
-    let hello_packet = [0x05, 0x01, auth_method]; // SOCKS5, 1 method, auth method
-    socks5_stream.write_all(&hello_packet).await?;
-
-    // 读取服务器响应
-    let mut response = [0u8; 2];
-    socks5_stream.read_exact(&mut response).await?;
-
-    if response[0] != 0x05 {
-        return Err(anyhow::anyhow!("SOCKS5 服务器版本不正确"));
-    }
-
-    let selected_method = response[1];
-
-    // 处理认证
-    if selected_method == 0x02 {
-        // 用户名/密码认证
-        if let (Some(username), Some(password)) = (&socks5_config.username, &socks5_config.password) {
-            let mut auth_packet = vec![0x01]; // 认证版本
-
-            // 添加用户名
-            if username.len() > 255 {
-                return Err(anyhow::anyhow!("用户名太长"));
-            }
-            auth_packet.push(username.len() as u8);
-            auth_packet.extend_from_slice(username.as_bytes());
-
-            // 添加密码
-            if password.len() > 255 {
-                return Err(anyhow::anyhow!("密码太长"));
-            }
-            auth_packet.push(password.len() as u8);
-            auth_packet.extend_from_slice(password.as_bytes());
-
-            socks5_stream.write_all(&auth_packet).await?;
-
-            // 读取认证响应
-            let mut auth_response = [0u8; 2];
-            socks5_stream.read_exact(&mut auth_response).await?;
-
-            if auth_response[1] != 0x00 {
-                return Err(anyhow::anyhow!("SOCKS5 认证失败"));
-            }
-        } else {
-            return Err(anyhow::anyhow!("SOCKS5 需要认证但未提供凭证"));
-        }
-    } else if selected_method == 0xFF {
-        return Err(anyhow::anyhow!("SOCKS5 服务器不支持任何认证方法"));
-    }
-
-    // 发送连接请求
-    let mut connect_packet = vec![
-        0x05, // SOCKS5
-        0x01, // CONNECT
-        0x00, // 保留
-    ];
-
-    // 地址类型和地址
-    if let Ok(ip) = target_host.parse::<std::net::IpAddr>() {
-        // IP 地址
-        match ip {
-            std::net::IpAddr::V4(ipv4) => {
-                connect_packet.push(0x01); // IPv4
-                connect_packet.extend_from_slice(&ipv4.octets());
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                connect_packet.push(0x04); // IPv6
-                connect_packet.extend_from_slice(&ipv6.octets());
-            }
-        }
-    } else {
-        // 域名
-        if target_host.len() > 255 {
-            return Err(anyhow::anyhow!("域名太长"));
-        }
-        connect_packet.push(0x03); // 域名
-        connect_packet.push(target_host.len() as u8);
-        connect_packet.extend_from_slice(target_host.as_bytes());
-    }
-
-    // 端口（大端字节序）
-    connect_packet.extend_from_slice(&target_port.to_be_bytes());
-
-    socks5_stream.write_all(&connect_packet).await?;
-
-    // 读取连接响应
-    let mut resp_header = [0u8; 4];
-    socks5_stream.read_exact(&mut resp_header).await?;
-
-    if resp_header[0] != 0x05 {
-        return Err(anyhow::anyhow!("SOCKS5 响应版本不正确"));
-    }
-
-    if resp_header[1] != 0x00 {
-        let error_msg = match resp_header[1] {
-            0x01 => "一般 SOCKS 服务器错误",
-            0x02 => "连接不允许（规则）",
-            0x03 => "网络不可达",
-            0x04 => "主机不可达",
-            0x05 => "连接被拒绝",
-            0x06 => "TTL 超时",
-            0x07 => "不支持的命令",
-            0x08 => "不支持的地址类型",
-            _ => "未知错误",
-        };
-        return Err(anyhow::anyhow!("SOCKS5 连接失败: {}", error_msg));
-    }
-
-    // 读取绑定地址信息（根据地址类型）
-    match resp_header[3] {
-        0x01 => {
-            // IPv4
-            let mut addr_buf = [0u8; 6]; // 4 bytes IPv4 + 2 bytes port
-            socks5_stream.read_exact(&mut addr_buf).await?;
-        }
-        0x03 => {
-            // 域名
-            let mut len_buf = [0u8; 1];
-            socks5_stream.read_exact(&mut len_buf).await?;
-            let len = len_buf[0] as usize;
-            let mut addr_buf = vec![0u8; len + 2]; // domain + 2 bytes port
-            socks5_stream.read_exact(&mut addr_buf).await?;
-        }
-        0x04 => {
-            // IPv6
-            let mut addr_buf = [0u8; 18]; // 16 bytes IPv6 + 2 bytes port
-            socks5_stream.read_exact(&mut addr_buf).await?;
-        }
-        _ => {
-            return Err(anyhow::anyhow!("不支持的地址类型"));
-        }
-    }
-
-    Ok(socks5_stream)
-}
-
-/// 带 DNS 缓存的 SOCKS5 连接函数
+/// 优化的 SOCKS5 连接函数
 ///
-/// 这个函数替代原来的 connect_via_socks5，增加了 DNS 缓存功能
+/// 直接传递域名给 SOCKS5 服务器，让服务器端解析 DNS（避免客户端重复解析）
 ///
 /// # 参数
 /// * `target_host` - 目标主机名
@@ -560,7 +389,7 @@ pub async fn connect_via_socks5_with_cache(
 
     // ============ 步骤 1: 连接到 SOCKS5 服务器 ============
     let mut socks5_stream = match timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         TcpStream::connect(&socks5_config.addr)
     ).await {
         Ok(Ok(stream)) => stream,
@@ -574,22 +403,6 @@ pub async fn connect_via_socks5_with_cache(
 
     let _ = socks5_stream.set_nodelay(true);
     debug!("已连接到 SOCKS5 服务器: {}", socks5_config.addr);
-
-    // ============ 步骤 2: DNS 解析（使用缓存）============
-    let target_ips = match resolve_host_cached(target_host).await {
-        Ok(ips) => ips,
-        Err(e) => {
-            error!("DNS 解析失败 {}: {}", target_host, e);
-            return Err(anyhow::anyhow!("DNS 解析失败: {}", target_host));
-        }
-    };
-
-    if target_ips.is_empty() {
-        return Err(anyhow::anyhow!("DNS 解析返回空列表: {}", target_host));
-    }
-
-    let target_ip = target_ips[0];
-    debug!("已解析 {} 到 {}", target_host, target_ip);
 
     // ============ 步骤 3: SOCKS5 握手 - 版本识别请求 ============
     // 构建 SOCKS5 请求：
@@ -613,7 +426,7 @@ pub async fn connect_via_socks5_with_cache(
 
     // 发送握手请求
     match timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         socks5_stream.write_all(&request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 握手请求"),
@@ -624,10 +437,10 @@ pub async fn connect_via_socks5_with_cache(
     // ============ 步骤 4: 读取握手响应 ============
     let mut response = [0u8; 2];
     match timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         socks5_stream.read_exact(&mut response)
     ).await {
-        Ok(Ok((n))) => {
+        Ok(Ok(n)) => {
             debug!("读取握手响应成功，字节数: {}", n)
         },
         Ok(Err(e)) => return Err(anyhow::anyhow!("读取 SOCKS5 握手响应失败: {}", e)),
@@ -654,7 +467,7 @@ pub async fn connect_via_socks5_with_cache(
 
             // 发送认证请求
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.write_all(&auth_request)
             ).await {
                 Ok(Ok(())) => debug!("已发送认证请求"),
@@ -665,10 +478,10 @@ pub async fn connect_via_socks5_with_cache(
             // 读取认证响应
             let mut auth_response = [0u8; 2];
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.read_exact(&mut auth_response)
             ).await {
-                Ok(Ok((n))) => {},
+                Ok(Ok(_)) => {},
                 Ok(Err(e)) => return Err(anyhow::anyhow!("读取认证响应失败: {}", e)),
                 Err(_) => return Err(anyhow::anyhow!("读取认证响应超时")),
             }
@@ -703,24 +516,20 @@ pub async fn connect_via_socks5_with_cache(
     connect_request.push(1u8);   // 连接命令 (CONNECT)
     connect_request.push(0u8);   // 保留字段
 
-    // 地址类型和地址
-    match target_ip {
-        IpAddr::V4(ipv4) => {
-            connect_request.push(1u8);  // IPv4
-            connect_request.extend_from_slice(&ipv4.octets());
-        }
-        IpAddr::V6(ipv6) => {
-            connect_request.push(4u8);  // IPv6
-            connect_request.extend_from_slice(&ipv6.octets());
-        }
+    // ⚡ 优化：直接使用域名，让 SOCKS5 服务器解析 DNS
+    if target_host.len() > 255 {
+        return Err(anyhow::anyhow!("域名太长: {}", target_host));
     }
+    connect_request.push(0x03);  // 域名类型
+    connect_request.push(target_host.len() as u8);  // 域名长度
+    connect_request.extend_from_slice(target_host.as_bytes());  // 域名
 
     // 目标端口（网络字节序）
     connect_request.extend_from_slice(&target_port.to_be_bytes());
 
     // 发送连接请求
     match timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         socks5_stream.write_all(&connect_request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 连接请求"),
@@ -731,10 +540,10 @@ pub async fn connect_via_socks5_with_cache(
     // ============ 步骤 7: 读取连接响应 ============
     let mut response = [0u8; 4];
     match timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         socks5_stream.read_exact(&mut response)
     ).await {
-        Ok(Ok((n))) => {},
+        Ok(Ok(_)) => {},
         Ok(Err(e)) => return Err(anyhow::anyhow!("读取 SOCKS5 连接响应失败: {}", e)),
         Err(_) => return Err(anyhow::anyhow!("读取 SOCKS5 连接响应超时")),
     }
@@ -764,10 +573,10 @@ pub async fn connect_via_socks5_with_cache(
             // IPv4: 需要读 4 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 6];
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
-                Ok(Ok((n))) => {},
+                Ok(Ok(_)) => {},
                 Ok(Err(e)) => return Err(anyhow::anyhow!("读取地址数据失败: {}", e)),
                 Err(_) => return Err(anyhow::anyhow!("读取地址数据超时")),
             }
@@ -780,10 +589,10 @@ pub async fn connect_via_socks5_with_cache(
             // IPv6: 需要读 16 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 18];
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
-                Ok(Ok((n))) => {},
+                Ok(Ok(_)) => {},
                 Ok(Err(e)) => return Err(anyhow::anyhow!("读取地址数据失败: {}", e)),
                 Err(_) => return Err(anyhow::anyhow!("读取地址数据超时")),
             }
@@ -795,10 +604,10 @@ pub async fn connect_via_socks5_with_cache(
             // 域名: 需要读 1 个字节长度 + N 个字节域名 + 2 个字节端口
             let mut len_buf = [0u8; 1];
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.read_exact(&mut len_buf)
             ).await {
-                Ok(Ok((n))) => {},
+                Ok(Ok(_)) => {},
                 Ok(Err(e)) => return Err(anyhow::anyhow!("读取域名长度失败: {}", e)),
                 Err(_) => return Err(anyhow::anyhow!("读取域名长度超时")),
             }
@@ -806,10 +615,10 @@ pub async fn connect_via_socks5_with_cache(
             let domain_len = len_buf[0] as usize;
             let mut domain_data = vec![0u8; domain_len + 2];
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(5),
                 socks5_stream.read_exact(&mut domain_data)
             ).await {
-                Ok(Ok(n)) => {},
+                Ok(Ok(_)) => {},
                 Ok(Err(e)) => return Err(anyhow::anyhow!("读取域名数据失败: {}", e)),
                 Err(_) => return Err(anyhow::anyhow!("读取域名数据超时")),
             }
