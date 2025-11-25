@@ -1,0 +1,19 @@
+{
+  "listen_addr": "127.0.0.1:8443",
+  "whitelist": [
+    "www.google.com",
+    "github.com",
+    "*.github.io"
+  ],
+  "log": {
+    "level": "debug",
+    "output": "both",
+    "file_path": "logs/debug.log",
+    "enable_rotation": true,
+    "max_size_mb": 10,
+    "max_backups": 3,
+    "show_timestamp": true,
+    "show_module": true,
+    "use_color": true
+  }
+}
