@@ -9,6 +9,7 @@ use tokio::time::timeout;
 
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
+use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy::proxy_data;
 use crate::socks5::{connect_via_socks5, Socks5Config};
 use crate::tls::parse_sni;
@@ -25,6 +26,8 @@ pub struct SniProxy {
     max_connections: usize,
     /// SOCKS5 代理配置（可选）
     socks5_config: Option<Arc<Socks5Config>>,
+    /// 性能监控指标
+    metrics: Metrics,
 }
 
 impl SniProxy {
@@ -38,6 +41,7 @@ impl SniProxy {
             socks5_matcher: None,
             max_connections: 10000, // 默认最大并发连接数
             socks5_config: None,
+            metrics: Metrics::new(),
         }
     }
 
@@ -60,6 +64,7 @@ impl SniProxy {
             socks5_matcher,
             max_connections: 10000,
             socks5_config: None,
+            metrics: Metrics::new(),
         }
     }
 
@@ -73,6 +78,11 @@ impl SniProxy {
     pub fn with_socks5(mut self, socks5_config: Socks5Config) -> Self {
         self.socks5_config = Some(Arc::new(socks5_config));
         self
+    }
+
+    /// 获取监控指标
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// 启动代理服务器
@@ -149,6 +159,16 @@ impl SniProxy {
         // 使用信号量限制并发连接数
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
 
+        // 启动后台任务：每分钟打印监控指标
+        let metrics_clone = self.metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                metrics_clone.print_summary();
+            }
+        });
+
         loop {
             use std::time::Instant;
 
@@ -183,6 +203,7 @@ impl SniProxy {
                     let direct_matcher = Arc::clone(&self.direct_matcher);
                     let socks5_matcher = self.socks5_matcher.clone();
                     let socks5_config = self.socks5_config.clone();
+                    let metrics = self.metrics.clone();
 
                     tokio::spawn(async move {
                         // 持有许可直到连接处理完成
@@ -192,7 +213,8 @@ impl SniProxy {
                             client_stream,
                             direct_matcher,
                             socks5_matcher,
-                            socks5_config
+                            socks5_config,
+                            metrics
                         ).await {
                             debug!("处理连接时出错: {}", e);
                         }
@@ -216,9 +238,13 @@ async fn handle_connection(
     direct_matcher: Arc<DomainMatcher>,
     socks5_matcher: Option<Arc<DomainMatcher>>,
     socks5_config: Option<Arc<Socks5Config>>,
+    metrics: Metrics,
 ) -> Result<()> {
     use std::time::Instant;
     let start_time = Instant::now();
+
+    // 使用 ConnectionGuard 自动管理连接计数
+    let _guard = ConnectionGuard::new(metrics.clone());
 
     // 设置 TCP KeepAlive
     let _ = client_stream.set_nodelay(true);
@@ -232,10 +258,13 @@ async fn handle_connection(
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
+            metrics.inc_failed_connections();
             return Ok(());
         }
         Err(_) => {
             warn!("读取客户端数据超时");
+            metrics.inc_connection_timeouts();
+            metrics.inc_failed_connections();
             return Ok(());
         }
     };
@@ -256,6 +285,8 @@ async fn handle_connection(
         }
         None => {
             warn!("无法解析 SNI，拒绝连接");
+            metrics.inc_sni_parse_errors();
+            metrics.inc_failed_connections();
             return Ok(());
         }
     };
@@ -265,21 +296,26 @@ async fn handle_connection(
         // 优先检查 SOCKS5 白名单
         if socks5_matcher.matches(&sni) {
             info!("域名 {} 匹配 SOCKS5 白名单", sni);
+            metrics.inc_socks5_requests();
             true
         } else if direct_matcher.matches(&sni) {
             info!("域名 {} 匹配直连白名单", sni);
+            metrics.inc_direct_requests();
             false
         } else {
             warn!("域名 {} 不在任何白名单中，拒绝连接", sni);
+            metrics.inc_rejected_requests();
             return Ok(());
         }
     } else {
         // 如果没有 SOCKS5 白名单，只检查直连白名单
         if direct_matcher.matches(&sni) {
             info!("域名 {} 匹配白名单，使用直连", sni);
+            metrics.inc_direct_requests();
             false
         } else {
             warn!("域名 {} 不在白名单中，拒绝连接", sni);
+            metrics.inc_rejected_requests();
             return Ok(());
         }
     };
@@ -297,6 +333,8 @@ async fn handle_connection(
             },
             Err(e) => {
                 error!("通过 SOCKS5 连接到 {}:443 失败: {} (耗时 {:?})", sni, e, connect_start.elapsed());
+                metrics.inc_socks5_errors();
+                metrics.inc_failed_connections();
                 return Ok(());
             }
         }
@@ -311,10 +349,13 @@ async fn handle_connection(
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 error!("连接到目标服务器 {} 失败: {}", target_addr, e);
+                metrics.inc_failed_connections();
                 return Ok(());
             }
             Err(_) => {
                 error!("连接到目标服务器 {} 超时", target_addr);
+                metrics.inc_connection_timeouts();
+                metrics.inc_failed_connections();
                 return Ok(());
             }
         }
@@ -334,7 +375,7 @@ async fn handle_connection(
 
     // 双向转发数据
     let proxy_start = Instant::now();
-    if let Err(e) = proxy_data(client_stream, target_stream).await {
+    if let Err(e) = proxy_data(client_stream, target_stream, metrics.clone()).await {
         debug!("数据转发结束: {}", e);
     }
 

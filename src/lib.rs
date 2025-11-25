@@ -2,6 +2,7 @@
 pub mod dns;
 pub mod domain;
 pub mod logger;
+pub mod metrics;
 pub mod proxy;
 pub mod server;
 pub mod socks5;
@@ -11,6 +12,7 @@ pub mod tls;
 pub use dns::{clear_dns_cache, get_dns_cache_size, resolve_host_cached};
 pub use domain::DomainMatcher;
 pub use logger::{init_default_logger, init_from_env, init_logger, LogConfig, LogLevel};
+pub use metrics::{Metrics, MetricsSnapshot};
 pub use proxy::proxy_data;
 pub use server::SniProxy;
 pub use socks5::{connect_via_socks5, Socks5Config};

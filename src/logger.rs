@@ -206,7 +206,8 @@ impl FileWriter {
         }
 
         self.file.write_all(bytes)?;
-        self.file.flush()?;
+        // 移除每次flush，改为依赖操作系统缓冲，提升性能
+        // 仅在轮转时flush
         self.current_size += bytes.len() as u64;
         Ok(())
     }
