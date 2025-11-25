@@ -292,6 +292,7 @@ impl SniProxy {
             use std::time::Instant;
 
             // ⏱️ 测量 accept 耗时
+            debug!("准备接受下一个连接...");
             let accept_start = Instant::now();
             match listener.accept().await {
                 Ok((client_stream, client_addr)) => {
@@ -326,9 +327,11 @@ impl SniProxy {
                         // 持有许可直到连接处理完成
                         let _permit = permit;
 
+                        debug!("开始处理连接...");
                         if let Err(e) = handle_connection(client_stream, domain_matcher, socks5_config).await {
                             debug!("处理连接时出错: {}", e);
                         }
+                        debug!("连接处理完成");
                     });
                 }
                 Err(e) => {
@@ -372,7 +375,7 @@ async fn handle_connection(
     };
 
     if n == 0 {
-        debug!("客户端连接已关闭");
+        debug!("客户端连接已关闭（read 返回 0 字节，可能是客户端在发送数据前就断开了）");
         return Ok(());
     }
 
