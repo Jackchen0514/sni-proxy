@@ -296,6 +296,9 @@ impl SniProxy {
 
         info!("🔄 Accept loop 开始运行（专用阻塞线程模式）...");
 
+        // 获取当前 Tokio runtime handle，用于在阻塞线程中 spawn 任务
+        let runtime_handle = tokio::runtime::Handle::current();
+
         // 🔧 关键优化：在专用线程中运行阻塞式 accept，避免 Tokio 调度延迟
         // 使用 std::thread 而不是 tokio::spawn，这样 accept 不会被 Tokio 调度影响
         std::thread::spawn(move || {
@@ -337,21 +340,20 @@ impl SniProxy {
                             continue;
                         }
 
-                        // 转换为 Tokio TcpStream
-                        let tokio_stream = match tokio::net::TcpStream::from_std(stream) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("转换 TcpStream 失败: {}", e);
-                                continue;
-                            }
-                        };
-
                         let domain_matcher_clone = Arc::clone(&domain_matcher);
                         let socks5_config_clone = socks5_config.clone();
                         let semaphore_clone = Arc::clone(&semaphore);
 
-                        // 🔧 在 Tokio 运行时中处理连接
-                        tokio::spawn(async move {
+                        // 🔧 在 Tokio 运行时中处理连接（使用 runtime_handle）
+                        runtime_handle.spawn(async move {
+                            // 在 Tokio 上下文中转换 TcpStream
+                            let tokio_stream = match tokio::net::TcpStream::from_std(stream) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!("转换 TcpStream 失败: {}", e);
+                                    return;
+                                }
+                            };
                             // 在任务内部获取 permit
                             let permit_start = std::time::Instant::now();
                             let _permit = match semaphore_clone.acquire_owned().await {
