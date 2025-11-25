@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -197,7 +197,7 @@ impl SniProxy {
         Self {
             listen_addr,
             domain_matcher: Arc::new(domain_matcher),
-            max_connections: 10000, // 默认最大并发连接数
+            max_connections: 50000, // 默认最大并发连接数（提高到 50000）
             socks5_config: None,
         }
     }
@@ -262,6 +262,7 @@ impl SniProxy {
 
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
+        info!("🚀 服务器已就绪，等待连接...");
 
         // ⚡ 预热：预解析热门域名的 DNS（仅用于直连模式）
         if self.socks5_config.is_none() {
@@ -294,40 +295,42 @@ impl SniProxy {
             // ⏱️ 测量 accept 耗时
             debug!("准备接受下一个连接...");
             let accept_start = Instant::now();
+
+            // 🔧 关键修复：先 accept，但不阻塞等待 permit
+            // 如果没有可用的 permit，在 spawn 的任务中等待，不阻塞 accept loop
             match listener.accept().await {
                 Ok((client_stream, client_addr)) => {
                     let accept_elapsed = accept_start.elapsed();
-
-                    // ⏱️ 测量获取 permit 耗时
-                    let permit_start = Instant::now();
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!("获取连接许可失败: {}", e);
-                            continue;
-                        }
-                    };
-                    let permit_elapsed = permit_start.elapsed();
 
                     // 只在慢的时候打印警告
                     if accept_elapsed.as_millis() > 100 {
                         warn!("⏱️  接受连接慢: {}ms (来自 {})", accept_elapsed.as_millis(), client_addr);
                     }
-                    if permit_elapsed.as_millis() > 10 {
-                        debug!("⏱️  等待许可: {}ms", permit_elapsed.as_millis());
-                    }
 
-                    debug!("接受来自 {} 的新连接 (accept: {:?}, permit: {:?})",
-                           client_addr, accept_elapsed, permit_elapsed);
+                    debug!("接受来自 {} 的新连接 (accept: {:?})", client_addr, accept_elapsed);
 
                     let domain_matcher = Arc::clone(&self.domain_matcher);
                     let socks5_config = self.socks5_config.clone();
+                    let semaphore_clone = Arc::clone(&semaphore);
 
+                    // 🔧 关键修复：在 spawn 的任务中获取 permit，不阻塞 accept loop
                     tokio::spawn(async move {
-                        // 持有许可直到连接处理完成
-                        let _permit = permit;
+                        // 在任务内部获取 permit，这样不会阻塞 accept
+                        let permit_start = std::time::Instant::now();
+                        let _permit = match semaphore_clone.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!("获取连接许可失败: {}", e);
+                                return;
+                            }
+                        };
+                        let permit_elapsed = permit_start.elapsed();
 
-                        debug!("开始处理连接...");
+                        if permit_elapsed.as_millis() > 100 {
+                            warn!("⏱️  等待 permit: {}ms", permit_elapsed.as_millis());
+                        }
+
+                        debug!("开始处理连接 (permit 耗时: {:?})...", permit_elapsed);
                         if let Err(e) = handle_connection(client_stream, domain_matcher, socks5_config).await {
                             debug!("处理连接时出错: {}", e);
                         }
