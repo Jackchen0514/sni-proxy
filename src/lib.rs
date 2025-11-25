@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use lru::LruCache;
 use lazy_static::lazy_static;
@@ -214,7 +214,7 @@ impl SniProxy {
         self
     }
 
-    /// 启动代理服务器
+    /// 启动代理服务器（使用专用 accept 线程以避免 Tokio 调度延迟）
     pub async fn run(&self) -> Result<()> {
         // 创建 socket 并设置选项
         use socket2::{Socket, Domain, Type, Protocol};
@@ -257,8 +257,11 @@ impl SniProxy {
         // 转换为标准库的 TcpListener
         let std_listener: std::net::TcpListener = socket.into();
 
-        // 转换为 Tokio 的 TcpListener
-        let listener = TcpListener::from_std(std_listener)?;
+        // 🔧 关键优化：设置为阻塞模式，在专用线程中 accept
+        // 这样可以避免 Tokio 异步调度延迟
+        std_listener.set_nonblocking(false)?;
+
+        info!("⚡ 使用专用阻塞线程进行 accept，避免 Tokio 调度延迟");
 
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
@@ -288,80 +291,101 @@ impl SniProxy {
 
         // 使用信号量限制并发连接数
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
+        let domain_matcher = self.domain_matcher.clone();
+        let socks5_config = self.socks5_config.clone();
 
-        let mut loop_count = 0u64;
-        let mut last_loop_time = std::time::Instant::now();
+        info!("🔄 Accept loop 开始运行（专用阻塞线程模式）...");
 
-        info!("🔄 Accept loop 开始运行...");
+        // 🔧 关键优化：在专用线程中运行阻塞式 accept，避免 Tokio 调度延迟
+        // 使用 std::thread 而不是 tokio::spawn，这样 accept 不会被 Tokio 调度影响
+        std::thread::spawn(move || {
+            let mut loop_count = 0u64;
+            let mut last_accept_time = std::time::Instant::now();
 
-        loop {
-            use std::time::Instant;
+            loop {
+                loop_count += 1;
+                let since_last_accept = last_accept_time.elapsed();
 
-            loop_count += 1;
-            let since_last_loop = last_loop_time.elapsed();
+                // 如果距离上次 accept 超过 1 秒，说明可能有问题
+                if since_last_accept.as_millis() > 1000 {
+                    warn!("⚠️  两次 accept 间隔过长: {}ms", since_last_accept.as_millis());
+                }
 
-            // 如果距离上次循环超过 1 秒，说明可能有问题
-            if since_last_loop.as_millis() > 1000 {
-                warn!("⚠️  Accept loop 间隔过长: {}ms (可能是 Tokio 调度延迟或其他任务占用线程)",
-                    since_last_loop.as_millis());
-            }
+                if loop_count % 1000 == 0 {
+                    debug!("Accept loop 运行次数: {}", loop_count);
+                }
 
-            if loop_count % 100 == 0 {
-                debug!("Accept loop 运行次数: {}", loop_count);
-            }
+                // ⏱️ 测量 accept 耗时
+                let accept_start = std::time::Instant::now();
+                last_accept_time = accept_start;
 
-            // ⏱️ 测量从这次循环开始到 accept 完成的时间
-            let loop_start = Instant::now();
-            last_loop_time = loop_start;
+                // 🔧 阻塞式 accept，不会被 Tokio 调度影响
+                match std_listener.accept() {
+                    Ok((stream, addr)) => {
+                        let accept_elapsed = accept_start.elapsed();
 
-            // 🔧 关键修复：先 accept，但不阻塞等待 permit
-            // 如果没有可用的 permit，在 spawn 的任务中等待，不阻塞 accept loop
-            match listener.accept().await {
-                Ok((client_stream, client_addr)) => {
-                    let loop_elapsed = loop_start.elapsed();
+                        // 只在慢的时候打印警告
+                        if accept_elapsed.as_millis() > 100 {
+                            warn!("⏱️  Accept 慢: {}ms (来自 {})", accept_elapsed.as_millis(), addr);
+                        }
 
-                    // 只在慢的时候打印警告
-                    if loop_elapsed.as_millis() > 100 {
-                        warn!("⏱️  Accept loop 慢: {}ms (从循环开始到接受完成，来自 {})",
-                            loop_elapsed.as_millis(), client_addr);
-                    }
+                        debug!("接受来自 {} 的新连接 (accept 耗时: {:?})", addr, accept_elapsed);
 
-                    debug!("接受来自 {} 的新连接 (loop 耗时: {:?})", client_addr, loop_elapsed);
+                        // 转换为非阻塞模式供 Tokio 使用
+                        if let Err(e) = stream.set_nonblocking(true) {
+                            error!("设置非阻塞模式失败: {}", e);
+                            continue;
+                        }
 
-                    let domain_matcher = Arc::clone(&self.domain_matcher);
-                    let socks5_config = self.socks5_config.clone();
-                    let semaphore_clone = Arc::clone(&semaphore);
-
-                    // 🔧 关键修复：在 spawn 的任务中获取 permit，不阻塞 accept loop
-                    tokio::spawn(async move {
-                        // 在任务内部获取 permit，这样不会阻塞 accept
-                        let permit_start = std::time::Instant::now();
-                        let _permit = match semaphore_clone.acquire_owned().await {
-                            Ok(p) => p,
+                        // 转换为 Tokio TcpStream
+                        let tokio_stream = match tokio::net::TcpStream::from_std(stream) {
+                            Ok(s) => s,
                             Err(e) => {
-                                error!("获取连接许可失败: {}", e);
-                                return;
+                                error!("转换 TcpStream 失败: {}", e);
+                                continue;
                             }
                         };
-                        let permit_elapsed = permit_start.elapsed();
 
-                        if permit_elapsed.as_millis() > 100 {
-                            warn!("⏱️  等待 permit: {}ms", permit_elapsed.as_millis());
-                        }
+                        let domain_matcher_clone = Arc::clone(&domain_matcher);
+                        let socks5_config_clone = socks5_config.clone();
+                        let semaphore_clone = Arc::clone(&semaphore);
 
-                        debug!("开始处理连接 (permit 耗时: {:?})...", permit_elapsed);
-                        if let Err(e) = handle_connection(client_stream, domain_matcher, socks5_config).await {
-                            debug!("处理连接时出错: {}", e);
-                        }
-                        debug!("连接处理完成");
-                    });
-                }
-                Err(e) => {
-                    error!("接受连接失败: {}", e);
-                    // 短暂休眠避免繁忙循环
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                        // 🔧 在 Tokio 运行时中处理连接
+                        tokio::spawn(async move {
+                            // 在任务内部获取 permit
+                            let permit_start = std::time::Instant::now();
+                            let _permit = match semaphore_clone.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    error!("获取连接许可失败: {}", e);
+                                    return;
+                                }
+                            };
+                            let permit_elapsed = permit_start.elapsed();
+
+                            if permit_elapsed.as_millis() > 100 {
+                                warn!("⏱️  等待 permit: {}ms", permit_elapsed.as_millis());
+                            }
+
+                            debug!("开始处理连接 (permit 耗时: {:?})...", permit_elapsed);
+                            if let Err(e) = handle_connection(tokio_stream, domain_matcher_clone, socks5_config_clone).await {
+                                debug!("处理连接时出错: {}", e);
+                            }
+                            debug!("连接处理完成");
+                        });
+                    }
+                    Err(e) => {
+                        error!("接受连接失败: {}", e);
+                        // 短暂休眠避免繁忙循环
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
+        });
+
+        // 主线程等待（防止程序退出）
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     }
 }
