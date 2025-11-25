@@ -292,6 +292,8 @@ impl SniProxy {
         let mut loop_count = 0u64;
         let mut last_loop_time = std::time::Instant::now();
 
+        info!("🔄 Accept loop 开始运行...");
+
         loop {
             use std::time::Instant;
 
