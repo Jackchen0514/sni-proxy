@@ -1,0 +1,31 @@
+{
+  "listen_addr": "0.0.0.0:8443",
+  "whitelist": [
+    "www.google.com",
+    "github.com",
+    "*.github.io",
+    "*.cloudflare.com"
+  ],
+  "socks5_whitelist": [
+    "*.anthropic.com",
+    "claude.ai",
+    "*.openai.com",
+    "chatgpt.com"
+  ],
+  "log": {
+    "level": "info",
+    "output": "both",
+    "file_path": "logs/sni-proxy.log",
+    "enable_rotation": true,
+    "max_size_mb": 100,
+    "max_backups": 5,
+    "show_timestamp": true,
+    "show_module": true,
+    "use_color": true
+  },
+  "socks5": {
+    "addr": "127.0.0.1:1080",
+    "username": null,
+    "password": null
+  }
+}

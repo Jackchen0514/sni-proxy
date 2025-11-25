@@ -8,7 +8,11 @@ use std::net::SocketAddr;
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     listen_addr: String,
+    /// 直连白名单
     whitelist: Vec<String>,
+    /// SOCKS5 白名单（可选）
+    #[serde(default)]
+    socks5_whitelist: Vec<String>,
     /// SOCKS5 代理配置（可选）
     socks5: Option<Socks5ConfigFile>,
     /// 日志配置（可选）
@@ -177,18 +181,39 @@ async fn main() -> Result<()> {
                    log_config_file.max_backups);
     }
 
-    log::info!("加载了 {} 个白名单域名", config.whitelist.len());
-
-    // 只显示前 10 个域名，避免日志过长
+    // 显示直连白名单
+    log::info!("加载了 {} 个直连白名单域名", config.whitelist.len());
     for (i, domain) in config.whitelist.iter().take(10).enumerate() {
-        log::info!("  [{}] {}", i + 1, domain);
+        log::info!("  [直连 {}] {}", i + 1, domain);
     }
     if config.whitelist.len() > 10 {
-        log::info!("  ... 还有 {} 个域名", config.whitelist.len() - 10);
+        log::info!("  ... 还有 {} 个直连域名", config.whitelist.len() - 10);
+    }
+
+    // 显示 SOCKS5 白名单
+    if !config.socks5_whitelist.is_empty() {
+        log::info!("加载了 {} 个 SOCKS5 白名单域名", config.socks5_whitelist.len());
+        for (i, domain) in config.socks5_whitelist.iter().take(10).enumerate() {
+            log::info!("  [SOCKS5 {}] {}", i + 1, domain);
+        }
+        if config.socks5_whitelist.len() > 10 {
+            log::info!("  ... 还有 {} 个 SOCKS5 域名", config.socks5_whitelist.len() - 10);
+        }
     }
 
     // 创建代理实例
-    let mut proxy = SniProxy::new(listen_addr, config.whitelist);
+    let has_socks5_whitelist = !config.socks5_whitelist.is_empty();
+    let mut proxy = if has_socks5_whitelist {
+        // 使用双白名单模式
+        SniProxy::new_with_dual_whitelist(
+            listen_addr,
+            config.whitelist,
+            config.socks5_whitelist,
+        )
+    } else {
+        // 使用单一白名单模式（仅直连）
+        SniProxy::new(listen_addr, config.whitelist)
+    };
 
     // 配置 SOCKS5（如果提供）
     if let Some(socks5_config_file) = config.socks5 {
@@ -215,8 +240,11 @@ async fn main() -> Result<()> {
         };
 
         proxy = proxy.with_socks5(socks5_config);
+    } else if has_socks5_whitelist {
+        log::warn!("配置了 SOCKS5 白名单但未配置 SOCKS5 代理服务器！");
+        log::warn!("SOCKS5 白名单将无法生效，请检查配置文件");
     } else {
-        log::info!("未配置 SOCKS5，使用直接连接");
+        log::info!("未配置 SOCKS5，所有流量使用直接连接");
     }
 
     log::info!("=== 服务器准备就绪 ===");

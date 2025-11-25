@@ -17,8 +17,10 @@ use crate::tls::parse_sni;
 pub struct SniProxy {
     /// 监听地址
     listen_addr: SocketAddr,
-    /// 域名匹配器
-    domain_matcher: Arc<DomainMatcher>,
+    /// 直连白名单域名匹配器
+    direct_matcher: Arc<DomainMatcher>,
+    /// SOCKS5 白名单域名匹配器
+    socks5_matcher: Option<Arc<DomainMatcher>>,
     /// 最大并发连接数
     max_connections: usize,
     /// SOCKS5 代理配置（可选）
@@ -26,14 +28,37 @@ pub struct SniProxy {
 }
 
 impl SniProxy {
-    /// 创建新的 SNI 代理实例
-    pub fn new(listen_addr: SocketAddr, whitelist: Vec<String>) -> Self {
-        let domain_matcher = DomainMatcher::new(whitelist);
+    /// 创建新的 SNI 代理实例（仅直连白名单）
+    pub fn new(listen_addr: SocketAddr, direct_whitelist: Vec<String>) -> Self {
+        let direct_matcher = DomainMatcher::new(direct_whitelist);
 
         Self {
             listen_addr,
-            domain_matcher: Arc::new(domain_matcher),
+            direct_matcher: Arc::new(direct_matcher),
+            socks5_matcher: None,
             max_connections: 10000, // 默认最大并发连接数
+            socks5_config: None,
+        }
+    }
+
+    /// 创建新的 SNI 代理实例（同时支持直连和 SOCKS5 白名单）
+    pub fn new_with_dual_whitelist(
+        listen_addr: SocketAddr,
+        direct_whitelist: Vec<String>,
+        socks5_whitelist: Vec<String>,
+    ) -> Self {
+        let direct_matcher = DomainMatcher::new(direct_whitelist);
+        let socks5_matcher = if socks5_whitelist.is_empty() {
+            None
+        } else {
+            Some(Arc::new(DomainMatcher::new(socks5_whitelist)))
+        };
+
+        Self {
+            listen_addr,
+            direct_matcher: Arc::new(direct_matcher),
+            socks5_matcher,
+            max_connections: 10000,
             socks5_config: None,
         }
     }
@@ -44,7 +69,7 @@ impl SniProxy {
         self
     }
 
-    /// 设置 SOCKS5 代理
+    /// 设置 SOCKS5 代理配置
     pub fn with_socks5(mut self, socks5_config: Socks5Config) -> Self {
         self.socks5_config = Some(Arc::new(socks5_config));
         self
@@ -155,14 +180,20 @@ impl SniProxy {
                     debug!("接受来自 {} 的新连接 (accept: {:?}, permit: {:?})",
                            client_addr, accept_elapsed, permit_elapsed);
 
-                    let domain_matcher = Arc::clone(&self.domain_matcher);
+                    let direct_matcher = Arc::clone(&self.direct_matcher);
+                    let socks5_matcher = self.socks5_matcher.clone();
                     let socks5_config = self.socks5_config.clone();
 
                     tokio::spawn(async move {
                         // 持有许可直到连接处理完成
                         let _permit = permit;
 
-                        if let Err(e) = handle_connection(client_stream, domain_matcher, socks5_config).await {
+                        if let Err(e) = handle_connection(
+                            client_stream,
+                            direct_matcher,
+                            socks5_matcher,
+                            socks5_config
+                        ).await {
                             debug!("处理连接时出错: {}", e);
                         }
                     });
@@ -179,9 +210,11 @@ impl SniProxy {
 
 /// 处理单个客户端连接
 /// ⚡ 优化版本: 更快的超时和更大的缓冲区
+/// 支持分流: 直连白名单和 SOCKS5 白名单
 async fn handle_connection(
     mut client_stream: TcpStream,
-    domain_matcher: Arc<DomainMatcher>,
+    direct_matcher: Arc<DomainMatcher>,
+    socks5_matcher: Option<Arc<DomainMatcher>>,
     socks5_config: Option<Arc<Socks5Config>>,
 ) -> Result<()> {
     use std::time::Instant;
@@ -227,18 +260,35 @@ async fn handle_connection(
         }
     };
 
-    // 检查白名单（支持通配符）
-    if !domain_matcher.matches(&sni) {
-        warn!("域名 {} 不在白名单中，拒绝连接", sni);
-        return Ok(());
-    }
-
-    info!("域名 {} 匹配白名单，建立代理连接", sni);
+    // 检查白名单并决定连接方式
+    let use_socks5 = if let Some(ref socks5_matcher) = socks5_matcher {
+        // 优先检查 SOCKS5 白名单
+        if socks5_matcher.matches(&sni) {
+            info!("域名 {} 匹配 SOCKS5 白名单", sni);
+            true
+        } else if direct_matcher.matches(&sni) {
+            info!("域名 {} 匹配直连白名单", sni);
+            false
+        } else {
+            warn!("域名 {} 不在任何白名单中，拒绝连接", sni);
+            return Ok(());
+        }
+    } else {
+        // 如果没有 SOCKS5 白名单，只检查直连白名单
+        if direct_matcher.matches(&sni) {
+            info!("域名 {} 匹配白名单，使用直连", sni);
+            false
+        } else {
+            warn!("域名 {} 不在白名单中，拒绝连接", sni);
+            return Ok(());
+        }
+    };
 
     // 连接到目标服务器
     let connect_start = Instant::now();
-    let target_stream = if let Some(socks5) = socks5_config {
+    let target_stream = if use_socks5 && socks5_config.is_some() {
         // 通过 SOCKS5 连接
+        let socks5 = socks5_config.as_ref().unwrap();
         info!("通过 SOCKS5 连接到 {}:443", sni);
         match connect_via_socks5(&sni, 443, socks5.as_ref()).await {
             Ok(stream) => {
