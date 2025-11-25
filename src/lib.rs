@@ -289,25 +289,42 @@ impl SniProxy {
         // 使用信号量限制并发连接数
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
 
+        let mut loop_count = 0u64;
+        let mut last_loop_time = std::time::Instant::now();
+
         loop {
             use std::time::Instant;
 
-            // ⏱️ 测量 accept 耗时
-            debug!("准备接受下一个连接...");
-            let accept_start = Instant::now();
+            loop_count += 1;
+            let since_last_loop = last_loop_time.elapsed();
+
+            // 如果距离上次循环超过 1 秒，说明可能有问题
+            if since_last_loop.as_millis() > 1000 {
+                warn!("⚠️  Accept loop 间隔过长: {}ms (可能是 Tokio 调度延迟或其他任务占用线程)",
+                    since_last_loop.as_millis());
+            }
+
+            if loop_count % 100 == 0 {
+                debug!("Accept loop 运行次数: {}", loop_count);
+            }
+
+            // ⏱️ 测量从这次循环开始到 accept 完成的时间
+            let loop_start = Instant::now();
+            last_loop_time = loop_start;
 
             // 🔧 关键修复：先 accept，但不阻塞等待 permit
             // 如果没有可用的 permit，在 spawn 的任务中等待，不阻塞 accept loop
             match listener.accept().await {
                 Ok((client_stream, client_addr)) => {
-                    let accept_elapsed = accept_start.elapsed();
+                    let loop_elapsed = loop_start.elapsed();
 
                     // 只在慢的时候打印警告
-                    if accept_elapsed.as_millis() > 100 {
-                        warn!("⏱️  接受连接慢: {}ms (来自 {})", accept_elapsed.as_millis(), client_addr);
+                    if loop_elapsed.as_millis() > 100 {
+                        warn!("⏱️  Accept loop 慢: {}ms (从循环开始到接受完成，来自 {})",
+                            loop_elapsed.as_millis(), client_addr);
                     }
 
-                    debug!("接受来自 {} 的新连接 (accept: {:?})", client_addr, accept_elapsed);
+                    debug!("接受来自 {} 的新连接 (loop 耗时: {:?})", client_addr, loop_elapsed);
 
                     let domain_matcher = Arc::clone(&self.domain_matcher);
                     let socks5_config = self.socks5_config.clone();

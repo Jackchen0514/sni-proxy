@@ -22,10 +22,12 @@ struct Socks5ConfigFile {
     password: Option<String>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() -> Result<()> {
     // 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    log::info!("Tokio 运行时配置: 32 工作线程");
 
     // 读取配置文件路径（命令行参数或默认值）
     let config_path = std::env::args()
