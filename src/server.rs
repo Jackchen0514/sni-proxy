@@ -151,6 +151,32 @@ impl SniProxy {
             }
         }
 
+        // ⚡ TCP Fast Open (服务端模式) - Linux 3.7+ 支持
+        // 允许客户端在 SYN 包中携带数据，节省 1 RTT
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                let fd = socket.as_raw_fd();
+                const TCP_FASTOPEN: libc::c_int = 23; // Linux TCP_FASTOPEN 常量
+                let queue_len: libc::c_int = 256; // TFO 队列长度
+                let result = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    TCP_FASTOPEN,
+                    &queue_len as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&queue_len) as libc::socklen_t,
+                );
+
+                if result == 0 {
+                    info!("✅ TCP Fast Open 已启用（服务端模式，队列: {}）", queue_len);
+                } else {
+                    warn!("⚠️  TCP Fast Open 启用失败（系统可能不支持）");
+                    warn!("   提示: 检查 /proc/sys/net/ipv4/tcp_fastopen");
+                }
+            }
+        }
+
         // 绑定地址
         let address = self.listen_addr.into();
         socket.bind(&address)?;
