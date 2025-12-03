@@ -2,6 +2,7 @@
 pub mod dns;
 pub mod domain;
 pub mod ip_matcher;
+pub mod ip_traffic;
 pub mod logger;
 pub mod metrics;
 pub mod proxy;
@@ -13,6 +14,7 @@ pub mod tls;
 pub use dns::{clear_dns_cache, get_dns_cache_size, resolve_host_cached};
 pub use domain::DomainMatcher;
 pub use ip_matcher::IpMatcher;
+pub use ip_traffic::{IpTrafficTracker, IpTrafficSnapshot};
 pub use logger::{init_default_logger, init_from_env, init_logger, LogConfig, LogLevel};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use proxy::proxy_data;

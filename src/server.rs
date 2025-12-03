@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
 use crate::ip_matcher::IpMatcher;
+use crate::ip_traffic::IpTrafficTracker;
 use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy::proxy_data;
 use crate::socks5::{connect_via_socks5, Socks5Config};
@@ -31,6 +32,8 @@ pub struct SniProxy {
     socks5_config: Option<Arc<Socks5Config>>,
     /// 性能监控指标
     metrics: Metrics,
+    /// IP 流量追踪器
+    ip_traffic_tracker: IpTrafficTracker,
 }
 
 impl SniProxy {
@@ -46,6 +49,7 @@ impl SniProxy {
             max_connections: 10000, // 默认最大并发连接数
             socks5_config: None,
             metrics: Metrics::new(),
+            ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
         }
     }
 
@@ -70,6 +74,7 @@ impl SniProxy {
             max_connections: 10000,
             socks5_config: None,
             metrics: Metrics::new(),
+            ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
         }
     }
 
@@ -92,6 +97,15 @@ impl SniProxy {
     /// 设置 SOCKS5 代理配置
     pub fn with_socks5(mut self, socks5_config: Socks5Config) -> Self {
         self.socks5_config = Some(Arc::new(socks5_config));
+        self
+    }
+
+    /// 启用 IP 流量追踪（仅对 IP 白名单中的 IP 进行统计）
+    ///
+    /// # 参数
+    /// * `max_tracked_ips` - 最大跟踪的 IP 数量（使用 LRU 缓存）
+    pub fn with_ip_traffic_tracking(mut self, max_tracked_ips: usize) -> Self {
+        self.ip_traffic_tracker = IpTrafficTracker::new(max_tracked_ips);
         self
     }
 
@@ -184,6 +198,19 @@ impl SniProxy {
             }
         });
 
+        // 启动后台任务：每分钟打印 IP 流量统计（仅在启用时）
+        if self.ip_traffic_tracker.is_enabled() {
+            let ip_traffic_tracker_clone = self.ip_traffic_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    ip_traffic_tracker_clone.print_summary(10); // 打印 TOP 10
+                }
+            });
+            info!("✅ IP 流量追踪已启用");
+        }
+
         loop {
             use std::time::Instant;
 
@@ -220,6 +247,7 @@ impl SniProxy {
                     let ip_matcher = self.ip_matcher.clone();
                     let socks5_config = self.socks5_config.clone();
                     let metrics = self.metrics.clone();
+                    let ip_traffic_tracker = self.ip_traffic_tracker.clone();
 
                     tokio::spawn(async move {
                         // 持有许可直到连接处理完成
@@ -232,7 +260,8 @@ impl SniProxy {
                             socks5_matcher,
                             ip_matcher,
                             socks5_config,
-                            metrics
+                            metrics,
+                            ip_traffic_tracker
                         ).await {
                             debug!("处理连接时出错: {}", e);
                         }
@@ -260,6 +289,7 @@ async fn handle_connection(
     ip_matcher: Option<Arc<IpMatcher>>,
     socks5_config: Option<Arc<Socks5Config>>,
     metrics: Metrics,
+    ip_traffic_tracker: IpTrafficTracker,
 ) -> Result<()> {
     use std::time::Instant;
     let start_time = Instant::now();
@@ -267,9 +297,10 @@ async fn handle_connection(
     // 使用 ConnectionGuard 自动管理连接计数
     let _guard = ConnectionGuard::new(metrics.clone());
 
+    let client_ip = client_addr.ip();
+
     // 检查 IP 白名单（如果配置了）
-    if let Some(ref ip_matcher) = ip_matcher {
-        let client_ip = client_addr.ip();
+    let ip_in_whitelist = if let Some(ref ip_matcher) = ip_matcher {
         if !ip_matcher.matches(client_ip) {
             let rejected = metrics.get_rejected_requests() + 1;
             warn!("❌ IP {} 不在白名单中，拒绝连接 | 累计拒绝: {}", client_ip, rejected);
@@ -277,6 +308,14 @@ async fn handle_connection(
             return Ok(());
         }
         debug!("✅ IP {} 通过白名单检查 (来自 {})", client_ip, client_addr);
+        true
+    } else {
+        false
+    };
+
+    // 如果 IP 在白名单中，记录连接（用于流量统计）
+    if ip_in_whitelist {
+        ip_traffic_tracker.record_connection(client_ip);
     }
 
     // 设置 TCP KeepAlive
@@ -410,7 +449,15 @@ async fn handle_connection(
 
     // 双向转发数据
     let proxy_start = Instant::now();
-    if let Err(e) = proxy_data(client_stream, target_stream, metrics.clone()).await {
+    if let Err(e) = proxy_data(
+        client_stream,
+        target_stream,
+        metrics.clone(),
+        client_ip,
+        ip_traffic_tracker.clone(),
+    )
+    .await
+    {
         debug!("数据转发结束: {}", e);
     }
 

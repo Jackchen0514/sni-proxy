@@ -1,8 +1,10 @@
 use anyhow::Result;
 use log::debug;
+use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::ip_traffic::IpTrafficTracker;
 use crate::metrics::Metrics;
 
 /// 双向代理数据传输（优化版本）
@@ -11,12 +13,15 @@ pub async fn proxy_data(
     client_stream: TcpStream,
     target_stream: TcpStream,
     metrics: Metrics,
+    client_ip: IpAddr,
+    ip_traffic_tracker: IpTrafficTracker,
 ) -> Result<()> {
     let (mut client_read, mut client_write) = client_stream.into_split();
     let (mut target_read, mut target_write) = target_stream.into_split();
 
     // ⚡ 优化：使用 64KB 缓冲区（从 16KB）以提高吞吐量
     let metrics_c2t = metrics.clone();
+    let ip_tracker_c2t = ip_traffic_tracker.clone();
     let client_to_target = async move {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -27,10 +32,13 @@ pub async fn proxy_data(
             };
             target_write.write_all(&buf[..n]).await?;
             metrics_c2t.add_bytes_received(n as u64);
+            // 记录 IP 流量（上传）
+            ip_tracker_c2t.record_received(client_ip, n as u64);
         }
     };
 
     let metrics_t2c = metrics.clone();
+    let ip_tracker_t2c = ip_traffic_tracker.clone();
     let target_to_client = async move {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -41,6 +49,8 @@ pub async fn proxy_data(
             };
             client_write.write_all(&buf[..n]).await?;
             metrics_t2c.add_bytes_sent(n as u64);
+            // 记录 IP 流量（下载）
+            ip_tracker_t2c.record_sent(client_ip, n as u64);
         }
     };
 
