@@ -18,10 +18,26 @@ struct Config {
     /// 如果为空，则不进行 IP 白名单检查
     #[serde(default)]
     ip_whitelist: Vec<String>,
+    /// IP 流量追踪配置（可选）
+    ip_traffic_tracking: Option<IpTrafficTrackingConfig>,
     /// SOCKS5 代理配置（可选）
     socks5: Option<Socks5ConfigFile>,
     /// 日志配置（可选）
     log: Option<LogConfigFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct IpTrafficTrackingConfig {
+    /// 是否启用 IP 流量追踪（仅对 IP 白名单中的 IP）
+    #[serde(default)]
+    enabled: bool,
+    /// 最大跟踪的 IP 数量（使用 LRU 缓存）
+    #[serde(default = "default_max_tracked_ips")]
+    max_tracked_ips: usize,
+}
+
+fn default_max_tracked_ips() -> usize {
+    1000
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -236,6 +252,15 @@ async fn main() -> Result<()> {
     // 配置 IP 白名单（如果提供）
     if !config.ip_whitelist.is_empty() {
         proxy = proxy.with_ip_whitelist(config.ip_whitelist);
+    }
+
+    // 配置 IP 流量追踪（如果启用且有 IP 白名单）
+    if let Some(tracking_config) = config.ip_traffic_tracking {
+        if tracking_config.enabled {
+            log::info!("配置 IP 流量追踪");
+            log::info!("  最大跟踪 IP 数量: {}", tracking_config.max_tracked_ips);
+            proxy = proxy.with_ip_traffic_tracking(tracking_config.max_tracked_ips);
+        }
     }
 
     // 配置 SOCKS5（如果提供）
