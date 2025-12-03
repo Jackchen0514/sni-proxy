@@ -325,8 +325,8 @@ async fn handle_connection(
         ip_traffic_tracker.record_connection(client_ip);
     }
 
-    // 设置 TCP KeepAlive
-    let _ = client_stream.set_nodelay(true);
+    // ⚡ 流媒体优化：设置 TCP 参数（1MB 缓冲区 + TCP_NODELAY）
+    let _ = crate::proxy::optimize_tcp_for_streaming(&client_stream);
 
     // ⚡ 优化：增加缓冲区到 64KB（从 16KB）
     let mut buffer = vec![0u8; 65536];
@@ -442,9 +442,9 @@ async fn handle_connection(
         }
     };
 
-    // 设置目标连接的 TCP 选项
+    // ⚡ 流媒体优化：设置目标连接的 TCP 参数
     let mut target_stream = target_stream;
-    let _ = target_stream.set_nodelay(true);
+    let _ = crate::proxy::optimize_tcp_for_streaming(&target_stream);
 
     debug!("成功连接到目标服务器 {}:443", sni);
 
