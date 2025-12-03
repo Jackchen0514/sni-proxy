@@ -1,7 +1,9 @@
 use log::{debug, info, warn};
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +65,8 @@ pub struct IpTrafficTracker {
     enabled: bool,
     /// 统计数据输出文件路径（可选）
     output_file: Option<String>,
+    /// 持久化数据文件路径（可选，用于服务重启后恢复数据）
+    persistence_file: Option<String>,
 }
 
 struct IpTrafficTrackerInner {
@@ -79,16 +83,30 @@ impl IpTrafficTracker {
     /// # 参数
     /// * `max_tracked_ips` - 最大跟踪的 IP 数量（使用 LRU，超过后会淘汰最少使用的）
     /// * `output_file` - 统计数据输出文件路径（可选，每次覆盖写入最新数据）
-    pub fn new(max_tracked_ips: usize, output_file: Option<String>) -> Self {
+    /// * `persistence_file` - 持久化数据文件路径（可选，用于服务重启后恢复数据）
+    pub fn new(max_tracked_ips: usize, output_file: Option<String>, persistence_file: Option<String>) -> Self {
         let capacity = NonZeroUsize::new(max_tracked_ips).unwrap();
-        Self {
+
+        let mut tracker = Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
                 stats: LruCache::new(capacity),
                 max_tracked_ips,
             })),
             enabled: true,
             output_file,
+            persistence_file: persistence_file.clone(),
+        };
+
+        // 尝试从持久化文件加载数据
+        if let Some(ref path) = persistence_file {
+            if let Err(e) = tracker.load_from_file(path) {
+                warn!("加载持久化数据失败: {}，将从空数据开始", e);
+            } else {
+                info!("✅ 成功从持久化文件加载数据: {}", path);
+            }
         }
+
+        tracker
     }
 
     /// 创建禁用的追踪器（不进行任何统计）
@@ -100,6 +118,7 @@ impl IpTrafficTracker {
             })),
             enabled: false,
             output_file: None,
+            persistence_file: None,
         }
     }
 
@@ -239,6 +258,13 @@ impl IpTrafficTracker {
                 warn!("写入统计文件失败: {}", e);
             }
         }
+
+        // 保存到持久化文件（如果配置了）
+        if let Some(ref path) = self.persistence_file {
+            if let Err(e) = self.save_to_persistence_file(path) {
+                warn!("保存持久化数据失败: {}", e);
+            }
+        }
     }
 
     /// 写入统计数据到文件（覆盖写入）
@@ -285,6 +311,88 @@ impl IpTrafficTracker {
         Ok(())
     }
 
+    /// 保存统计数据到持久化文件（JSON 格式）
+    fn save_to_persistence_file(&self, path: &str) -> std::io::Result<()> {
+        use std::time::SystemTime;
+
+        let inner = self.inner.lock().unwrap();
+
+        // 转换为可序列化的格式
+        let mut stats_map = HashMap::new();
+        for (ip, stats) in inner.stats.iter() {
+            stats_map.insert(
+                ip.to_string(),
+                PersistedStats {
+                    bytes_received: stats.get_received(),
+                    bytes_sent: stats.get_sent(),
+                    connections: stats.get_connections(),
+                },
+            );
+        }
+
+        let saved_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let data = PersistenceData {
+            stats: stats_map,
+            saved_at,
+        };
+
+        drop(inner); // 释放锁
+
+        // 序列化并写入文件
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let mut file = File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+
+        debug!("持久化数据已保存到: {}", path);
+        Ok(())
+    }
+
+    /// 从持久化文件加载统计数据
+    fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
+        use std::time::SystemTime;
+
+        let mut file = File::open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        let data: PersistenceData = serde_json::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let mut inner = self.inner.lock().unwrap();
+        let mut loaded_count = 0;
+
+        for (ip_str, persisted_stats) in data.stats {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                let stats = IpTrafficStats {
+                    bytes_received: Arc::new(AtomicU64::new(persisted_stats.bytes_received)),
+                    bytes_sent: Arc::new(AtomicU64::new(persisted_stats.bytes_sent)),
+                    connections: Arc::new(AtomicU64::new(persisted_stats.connections)),
+                };
+                inner.stats.put(ip, stats);
+                loaded_count += 1;
+            }
+        }
+
+        drop(inner);
+
+        info!("从持久化文件加载了 {} 个 IP 的统计数据 (保存于 {} 秒前)",
+            loaded_count,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(data.saved_at));
+
+        Ok(())
+    }
+
     /// 获取当前跟踪的 IP 数量
     pub fn get_tracked_count(&self) -> usize {
         if !self.enabled {
@@ -317,6 +425,22 @@ pub struct IpTrafficSnapshot {
     pub bytes_sent: u64,
     pub total_bytes: u64,
     pub connections: u64,
+}
+
+/// 持久化数据结构（可序列化）
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistenceData {
+    /// 统计数据映射表 (IP -> 统计信息)
+    stats: HashMap<String, PersistedStats>,
+    /// 保存时间戳
+    saved_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedStats {
+    bytes_received: u64,
+    bytes_sent: u64,
+    connections: u64,
 }
 
 /// 格式化字节数为人类可读格式

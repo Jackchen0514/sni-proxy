@@ -175,6 +175,82 @@ watch -n 1 cat ip_traffic_stats.txt
 head -20 ip_traffic_stats.txt
 ```
 
+### 3. 数据持久化 ✨ 新功能
+
+配置 `persistence_file` 后，统计数据会在服务重启后自动恢复，不会丢失。
+
+#### 配置方法
+
+```json
+{
+  "ip_traffic_tracking": {
+    "enabled": true,
+    "max_tracked_ips": 1000,
+    "output_file": "./ip_traffic_stats.txt",
+    "persistence_file": "./ip_traffic_persist.json"
+  }
+}
+```
+
+#### 工作原理
+
+1. **启动时加载**：服务启动时自动从持久化文件加载历史数据
+2. **定期保存**：每分钟自动保存当前统计数据到文件
+3. **服务重启**：重启后数据自动恢复，统计累积不中断
+
+#### 启动日志示例
+
+```
+[INFO] 配置 IP 流量追踪
+  最大跟踪 IP 数量: 1000
+  统计数据输出文件: ./ip_traffic_stats.txt
+  持久化数据文件: ./ip_traffic_persist.json
+[INFO] 从持久化文件加载了 45 个 IP 的统计数据 (保存于 120 秒前)
+[INFO] ✅ 成功从持久化文件加载数据: ./ip_traffic_persist.json
+```
+
+#### 持久化文件格式
+
+```json
+{
+  "stats": {
+    "192.168.1.100": {
+      "bytes_received": 1342177280,
+      "bytes_sent": 3758096384,
+      "connections": 1523
+    },
+    "192.168.1.101": {
+      "bytes_received": 839680000,
+      "bytes_sent": 2203318272,
+      "connections": 856
+    }
+  },
+  "saved_at": 1733216120
+}
+```
+
+#### 特点
+
+- ✅ **自动加载**：启动时自动恢复数据
+- ✅ **定期保存**：每分钟保存一次
+- ✅ **容错机制**：加载失败不影响服务启动
+- ✅ **JSON 格式**：易于备份和迁移
+- ✅ **时间戳**：记录保存时间
+
+#### 使用建议
+
+```bash
+# 定期备份持久化文件
+cp ip_traffic_persist.json ip_traffic_persist.json.backup
+
+# 迁移数据到新服务器
+scp ip_traffic_persist.json user@new-server:/path/to/
+
+# 清空统计（删除持久化文件后重启）
+rm ip_traffic_persist.json
+systemctl restart sni-proxy
+```
+
 ## 使用场景
 
 ### 场景 1: 监控用户流量

@@ -36,6 +36,8 @@ struct IpTrafficTrackingConfig {
     max_tracked_ips: usize,
     /// 统计数据输出文件路径（可选，每次覆盖写入最新数据）
     output_file: Option<String>,
+    /// 持久化数据文件路径（可选，用于服务重启后恢复数据）
+    persistence_file: Option<String>,
 }
 
 fn default_max_tracked_ips() -> usize {
@@ -264,9 +266,13 @@ async fn main() -> Result<()> {
             if let Some(ref output_file) = tracking_config.output_file {
                 log::info!("  统计数据输出文件: {}", output_file);
             }
+            if let Some(ref persistence_file) = tracking_config.persistence_file {
+                log::info!("  持久化数据文件: {}", persistence_file);
+            }
             proxy = proxy.with_ip_traffic_tracking(
                 tracking_config.max_tracked_ips,
                 tracking_config.output_file,
+                tracking_config.persistence_file,
             );
         }
     }

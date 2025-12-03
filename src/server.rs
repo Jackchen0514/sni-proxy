@@ -105,8 +105,14 @@ impl SniProxy {
     /// # 参数
     /// * `max_tracked_ips` - 最大跟踪的 IP 数量（使用 LRU 缓存）
     /// * `output_file` - 统计数据输出文件路径（可选）
-    pub fn with_ip_traffic_tracking(mut self, max_tracked_ips: usize, output_file: Option<String>) -> Self {
-        self.ip_traffic_tracker = IpTrafficTracker::new(max_tracked_ips, output_file);
+    /// * `persistence_file` - 持久化数据文件路径（可选）
+    pub fn with_ip_traffic_tracking(
+        mut self,
+        max_tracked_ips: usize,
+        output_file: Option<String>,
+        persistence_file: Option<String>,
+    ) -> Self {
+        self.ip_traffic_tracker = IpTrafficTracker::new(max_tracked_ips, output_file, persistence_file);
         self
     }
 

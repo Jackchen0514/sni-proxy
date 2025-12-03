@@ -17,7 +17,8 @@
   "ip_traffic_tracking": {
     "enabled": true,
     "max_tracked_ips": 1000,
-    "output_file": "./ip_traffic_stats.txt"
+    "output_file": "./ip_traffic_stats.txt",
+    "persistence_file": "./ip_traffic_persist.json"
   },
   "log": {
     "level": "info",
