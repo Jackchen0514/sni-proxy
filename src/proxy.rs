@@ -11,6 +11,7 @@ use crate::metrics::Metrics;
 /// 为流媒体场景优化 TCP 参数：
 /// - 更大的接收/发送缓冲区 (1MB)
 /// - TCP_NODELAY 避免 Nagle 算法延迟
+/// - TCP Fast Open 减少握手延迟
 #[allow(unused_variables)]
 pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
     // 设置 TCP_NODELAY（禁用 Nagle 算法，减少延迟）
@@ -21,8 +22,8 @@ pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
 
-        // 设置接收缓冲区为 1MB（流媒体需要大缓冲）
         unsafe {
+            // 设置接收缓冲区为 1MB（流媒体需要大缓冲）
             let rcvbuf_size: libc::c_int = 1024 * 1024; // 1MB
             libc::setsockopt(
                 fd,
@@ -41,6 +42,27 @@ pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
                 &sndbuf_size as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
+
+            // ⚡ 启用 TCP Fast Open（客户端模式）
+            // Linux 3.13+ 支持，节省 1 RTT
+            #[cfg(target_os = "linux")]
+            {
+                const TCP_FASTOPEN_CONNECT: libc::c_int = 30; // Linux 特定常量
+                let enable: libc::c_int = 1;
+                let result = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    TCP_FASTOPEN_CONNECT,
+                    &enable as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+
+                if result == 0 {
+                    debug!("✅ TCP Fast Open 已启用（客户端模式）");
+                } else {
+                    debug!("⚠️  TCP Fast Open 启用失败（可能系统不支持）");
+                }
+            }
         }
     }
 
