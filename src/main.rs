@@ -34,6 +34,8 @@ struct IpTrafficTrackingConfig {
     /// 最大跟踪的 IP 数量（使用 LRU 缓存）
     #[serde(default = "default_max_tracked_ips")]
     max_tracked_ips: usize,
+    /// 统计数据输出文件路径（可选，每次覆盖写入最新数据）
+    output_file: Option<String>,
 }
 
 fn default_max_tracked_ips() -> usize {
@@ -259,7 +261,13 @@ async fn main() -> Result<()> {
         if tracking_config.enabled {
             log::info!("配置 IP 流量追踪");
             log::info!("  最大跟踪 IP 数量: {}", tracking_config.max_tracked_ips);
-            proxy = proxy.with_ip_traffic_tracking(tracking_config.max_tracked_ips);
+            if let Some(ref output_file) = tracking_config.output_file {
+                log::info!("  统计数据输出文件: {}", output_file);
+            }
+            proxy = proxy.with_ip_traffic_tracking(
+                tracking_config.max_tracked_ips,
+                tracking_config.output_file,
+            );
         }
     }
 

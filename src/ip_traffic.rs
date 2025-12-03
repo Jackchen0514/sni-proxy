@@ -1,5 +1,7 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use lru::LruCache;
+use std::fs::File;
+use std::io::Write;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +61,8 @@ impl IpTrafficStats {
 pub struct IpTrafficTracker {
     inner: Arc<Mutex<IpTrafficTrackerInner>>,
     enabled: bool,
+    /// 统计数据输出文件路径（可选）
+    output_file: Option<String>,
 }
 
 struct IpTrafficTrackerInner {
@@ -74,7 +78,8 @@ impl IpTrafficTracker {
     ///
     /// # 参数
     /// * `max_tracked_ips` - 最大跟踪的 IP 数量（使用 LRU，超过后会淘汰最少使用的）
-    pub fn new(max_tracked_ips: usize) -> Self {
+    /// * `output_file` - 统计数据输出文件路径（可选，每次覆盖写入最新数据）
+    pub fn new(max_tracked_ips: usize, output_file: Option<String>) -> Self {
         let capacity = NonZeroUsize::new(max_tracked_ips).unwrap();
         Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
@@ -82,6 +87,7 @@ impl IpTrafficTracker {
                 max_tracked_ips,
             })),
             enabled: true,
+            output_file,
         }
     }
 
@@ -93,6 +99,7 @@ impl IpTrafficTracker {
                 max_tracked_ips: 0,
             })),
             enabled: false,
+            output_file: None,
         }
     }
 
@@ -195,6 +202,12 @@ impl IpTrafficTracker {
 
         if top_ips.is_empty() {
             info!("=== IP 流量统计（无数据） ===");
+            // 写入空数据到文件
+            if let Some(ref path) = self.output_file {
+                if let Err(e) = self.write_to_file(path, &[], 0) {
+                    warn!("写入统计文件失败: {}", e);
+                }
+            }
             return;
         }
 
@@ -219,6 +232,57 @@ impl IpTrafficTracker {
         let total_count = self.get_tracked_count();
         info!("{}", "-".repeat(100));
         info!("当前跟踪 IP 数量: {}", total_count);
+
+        // 写入到文件（如果配置了）
+        if let Some(ref path) = self.output_file {
+            if let Err(e) = self.write_to_file(path, &top_ips, total_count) {
+                warn!("写入统计文件失败: {}", e);
+            }
+        }
+    }
+
+    /// 写入统计数据到文件（覆盖写入）
+    fn write_to_file(&self, path: &str, top_ips: &[IpTrafficSnapshot], total_count: usize) -> std::io::Result<()> {
+        use std::time::SystemTime;
+
+        let mut file = File::create(path)?;
+
+        // 写入时间戳
+        if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+            writeln!(file, "更新时间: {}", chrono::DateTime::<chrono::Local>::from(
+                SystemTime::UNIX_EPOCH + duration
+            ).format("%Y-%m-%d %H:%M:%S"))?;
+        }
+        writeln!(file)?;
+
+        if top_ips.is_empty() {
+            writeln!(file, "=== IP 流量统计（无数据） ===")?;
+            return Ok(());
+        }
+
+        writeln!(file, "=== IP 流量统计（TOP {}）===", top_ips.len())?;
+        writeln!(file, "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
+                 "排名", "IP 地址", "上传", "下载", "总流量", "连接数")?;
+        writeln!(file, "{}", "-".repeat(100))?;
+
+        for (i, snapshot) in top_ips.iter().enumerate() {
+            writeln!(
+                file,
+                "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
+                i + 1,
+                snapshot.ip,
+                format_bytes(snapshot.bytes_received),
+                format_bytes(snapshot.bytes_sent),
+                format_bytes(snapshot.total_bytes),
+                snapshot.connections
+            )?;
+        }
+
+        writeln!(file, "{}", "-".repeat(100))?;
+        writeln!(file, "当前跟踪 IP 数量: {}", total_count)?;
+
+        file.flush()?;
+        Ok(())
     }
 
     /// 获取当前跟踪的 IP 数量
@@ -281,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_ip_traffic_tracker() {
-        let tracker = IpTrafficTracker::new(100);
+        let tracker = IpTrafficTracker::new(100, None);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
         // 记录连接
@@ -302,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_top_n() {
-        let tracker = IpTrafficTracker::new(100);
+        let tracker = IpTrafficTracker::new(100, None);
 
         let ip1: IpAddr = "192.168.1.1".parse().unwrap();
         let ip2: IpAddr = "192.168.1.2".parse().unwrap();
