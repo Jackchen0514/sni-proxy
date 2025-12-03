@@ -9,6 +9,7 @@ use tokio::time::timeout;
 
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
+use crate::ip_matcher::IpMatcher;
 use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy::proxy_data;
 use crate::socks5::{connect_via_socks5, Socks5Config};
@@ -22,6 +23,8 @@ pub struct SniProxy {
     direct_matcher: Arc<DomainMatcher>,
     /// SOCKS5 白名单域名匹配器
     socks5_matcher: Option<Arc<DomainMatcher>>,
+    /// IP 白名单匹配器（可选）
+    ip_matcher: Option<Arc<IpMatcher>>,
     /// 最大并发连接数
     max_connections: usize,
     /// SOCKS5 代理配置（可选）
@@ -39,6 +42,7 @@ impl SniProxy {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
             socks5_matcher: None,
+            ip_matcher: None,
             max_connections: 10000, // 默认最大并发连接数
             socks5_config: None,
             metrics: Metrics::new(),
@@ -62,10 +66,21 @@ impl SniProxy {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
             socks5_matcher,
+            ip_matcher: None,
             max_connections: 10000,
             socks5_config: None,
             metrics: Metrics::new(),
         }
+    }
+
+    /// 设置 IP 白名单
+    pub fn with_ip_whitelist(mut self, ip_whitelist: Vec<String>) -> Self {
+        let ip_matcher = IpMatcher::new(ip_whitelist);
+        // 只有在 IP 白名单不为空时才设置
+        if !ip_matcher.is_empty() {
+            self.ip_matcher = Some(Arc::new(ip_matcher));
+        }
+        self
     }
 
     /// 设置最大并发连接数
@@ -202,6 +217,7 @@ impl SniProxy {
 
                     let direct_matcher = Arc::clone(&self.direct_matcher);
                     let socks5_matcher = self.socks5_matcher.clone();
+                    let ip_matcher = self.ip_matcher.clone();
                     let socks5_config = self.socks5_config.clone();
                     let metrics = self.metrics.clone();
 
@@ -211,8 +227,10 @@ impl SniProxy {
 
                         if let Err(e) = handle_connection(
                             client_stream,
+                            client_addr,
                             direct_matcher,
                             socks5_matcher,
+                            ip_matcher,
                             socks5_config,
                             metrics
                         ).await {
@@ -233,10 +251,13 @@ impl SniProxy {
 /// 处理单个客户端连接
 /// ⚡ 优化版本: 更快的超时和更大的缓冲区
 /// 支持分流: 直连白名单和 SOCKS5 白名单
+/// 支持 IP 白名单: 只有在白名单中的 IP 才允许连接
 async fn handle_connection(
     mut client_stream: TcpStream,
+    client_addr: SocketAddr,
     direct_matcher: Arc<DomainMatcher>,
     socks5_matcher: Option<Arc<DomainMatcher>>,
+    ip_matcher: Option<Arc<IpMatcher>>,
     socks5_config: Option<Arc<Socks5Config>>,
     metrics: Metrics,
 ) -> Result<()> {
@@ -245,6 +266,17 @@ async fn handle_connection(
 
     // 使用 ConnectionGuard 自动管理连接计数
     let _guard = ConnectionGuard::new(metrics.clone());
+
+    // 检查 IP 白名单（如果配置了）
+    if let Some(ref ip_matcher) = ip_matcher {
+        let client_ip = client_addr.ip();
+        if !ip_matcher.matches(client_ip) {
+            warn!("IP {} 不在白名单中，拒绝连接", client_ip);
+            metrics.inc_rejected_requests();
+            return Ok(());
+        }
+        debug!("IP {} 通过白名单检查", client_ip);
+    }
 
     // 设置 TCP KeepAlive
     let _ = client_stream.set_nodelay(true);

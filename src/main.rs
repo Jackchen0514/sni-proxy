@@ -13,6 +13,11 @@ struct Config {
     /// SOCKS5 白名单（可选）
     #[serde(default)]
     socks5_whitelist: Vec<String>,
+    /// IP 白名单（可选）
+    /// 支持单个 IP 地址（如 "192.168.1.1"）或 CIDR 网段（如 "192.168.1.0/24"）
+    /// 如果为空，则不进行 IP 白名单检查
+    #[serde(default)]
+    ip_whitelist: Vec<String>,
     /// SOCKS5 代理配置（可选）
     socks5: Option<Socks5ConfigFile>,
     /// 日志配置（可选）
@@ -201,6 +206,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 显示 IP 白名单
+    if !config.ip_whitelist.is_empty() {
+        log::info!("加载了 {} 个 IP 白名单规则", config.ip_whitelist.len());
+        for (i, ip_pattern) in config.ip_whitelist.iter().take(10).enumerate() {
+            log::info!("  [IP {}] {}", i + 1, ip_pattern);
+        }
+        if config.ip_whitelist.len() > 10 {
+            log::info!("  ... 还有 {} 个 IP 规则", config.ip_whitelist.len() - 10);
+        }
+    } else {
+        log::info!("未配置 IP 白名单，允许所有 IP 访问");
+    }
+
     // 创建代理实例
     let has_socks5_whitelist = !config.socks5_whitelist.is_empty();
     let mut proxy = if has_socks5_whitelist {
@@ -214,6 +232,11 @@ async fn main() -> Result<()> {
         // 使用单一白名单模式（仅直连）
         SniProxy::new(listen_addr, config.whitelist)
     };
+
+    // 配置 IP 白名单（如果提供）
+    if !config.ip_whitelist.is_empty() {
+        proxy = proxy.with_ip_whitelist(config.ip_whitelist);
+    }
 
     // 配置 SOCKS5（如果提供）
     if let Some(socks5_config_file) = config.socks5 {
