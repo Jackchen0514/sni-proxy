@@ -127,6 +127,19 @@ impl Metrics {
         self.inner.connection_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
+    // 获取当前计数器值
+    pub fn get_total_connections(&self) -> u64 {
+        self.inner.total_connections.load(Ordering::Relaxed)
+    }
+
+    pub fn get_active_connections(&self) -> usize {
+        self.inner.active_connections.load(Ordering::Relaxed)
+    }
+
+    pub fn get_rejected_requests(&self) -> u64 {
+        self.inner.rejected_requests.load(Ordering::Relaxed)
+    }
+
     // 获取指标快照
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -203,6 +216,12 @@ impl ConnectionGuard {
     pub fn new(metrics: Metrics) -> Self {
         metrics.inc_total_connections();
         metrics.inc_active_connections();
+
+        // Debug: 打印连接数统计
+        let total = metrics.get_total_connections();
+        let active = metrics.get_active_connections();
+        log::debug!("📊 新连接建立 | 总连接数: {} | 活跃连接: {}", total, active);
+
         Self { metrics }
     }
 }
@@ -210,5 +229,10 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.metrics.dec_active_connections();
+
+        // Debug: 打印连接关闭后的统计
+        let active = self.metrics.get_active_connections();
+        let total = self.metrics.get_total_connections();
+        log::debug!("📊 连接关闭 | 总连接数: {} | 活跃连接: {}", total, active);
     }
 }

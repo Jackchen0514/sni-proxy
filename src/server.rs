@@ -271,11 +271,12 @@ async fn handle_connection(
     if let Some(ref ip_matcher) = ip_matcher {
         let client_ip = client_addr.ip();
         if !ip_matcher.matches(client_ip) {
-            warn!("IP {} 不在白名单中，拒绝连接", client_ip);
+            let rejected = metrics.get_rejected_requests() + 1;
+            warn!("❌ IP {} 不在白名单中，拒绝连接 | 累计拒绝: {}", client_ip, rejected);
             metrics.inc_rejected_requests();
             return Ok(());
         }
-        debug!("IP {} 通过白名单检查", client_ip);
+        debug!("✅ IP {} 通过白名单检查 (来自 {})", client_ip, client_addr);
     }
 
     // 设置 TCP KeepAlive
@@ -335,7 +336,8 @@ async fn handle_connection(
             metrics.inc_direct_requests();
             false
         } else {
-            warn!("域名 {} 不在任何白名单中，拒绝连接", sni);
+            let rejected = metrics.get_rejected_requests() + 1;
+            warn!("❌ 域名 {} 不在任何白名单中，拒绝连接 | 累计拒绝: {}", sni, rejected);
             metrics.inc_rejected_requests();
             return Ok(());
         }
@@ -346,7 +348,8 @@ async fn handle_connection(
             metrics.inc_direct_requests();
             false
         } else {
-            warn!("域名 {} 不在白名单中，拒绝连接", sni);
+            let rejected = metrics.get_rejected_requests() + 1;
+            warn!("❌ 域名 {} 不在白名单中，拒绝连接 | 累计拒绝: {}", sni, rejected);
             metrics.inc_rejected_requests();
             return Ok(());
         }
