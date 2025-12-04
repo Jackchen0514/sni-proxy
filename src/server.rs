@@ -43,12 +43,26 @@ impl SniProxy {
     pub fn new(listen_addr: SocketAddr, direct_whitelist: Vec<String>) -> Self {
         let direct_matcher = DomainMatcher::new(direct_whitelist);
 
+        // 🚀 自适应最大连接数：根据 CPU 核心数动态调整
+        // 经验值：每核心支持 500-1000 个并发连接
+        let num_cpus = num_cpus::get();
+        let max_connections = if num_cpus <= 2 {
+            // 小型服务器（1-2核）：500-1000 连接
+            num_cpus * 500
+        } else if num_cpus <= 8 {
+            // 中型服务器（4-8核）：2000-4000 连接
+            num_cpus * 500
+        } else {
+            // 大型服务器（16+核）：8000-10000 连接
+            std::cmp::min(10000, num_cpus * 500)
+        };
+
         Self {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
             socks5_matcher: None,
             ip_matcher: None,
-            max_connections: 10000, // 默认最大并发连接数
+            max_connections, // 自适应最大并发连接数
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
@@ -68,12 +82,22 @@ impl SniProxy {
             Some(Arc::new(DomainMatcher::new(socks5_whitelist)))
         };
 
+        // 🚀 自适应最大连接数：根据 CPU 核心数动态调整
+        let num_cpus = num_cpus::get();
+        let max_connections = if num_cpus <= 2 {
+            num_cpus * 500
+        } else if num_cpus <= 8 {
+            num_cpus * 500
+        } else {
+            std::cmp::min(10000, num_cpus * 500)
+        };
+
         Self {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
             socks5_matcher,
             ip_matcher: None,
-            max_connections: 10000,
+            max_connections, // 自适应最大并发连接数
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
@@ -483,12 +507,35 @@ async fn handle_connection(
     // ⚡ 流媒体优化：设置 TCP 参数（1MB 缓冲区 + TCP_NODELAY）
     let _ = crate::proxy::optimize_tcp_for_streaming(&client_stream);
 
-    // ⚡ 优化：增加缓冲区到 64KB（从 16KB）
-    let mut buffer = vec![0u8; 65536];
+    // ⚡ 自适应缓冲区大小：根据系统资源调整
+    // TLS Client Hello 通常 < 4KB，但保留余量
+    // 小型服务器（1-2核）：16KB（节省内存）
+    // 中型服务器（4-8核）：32KB（平衡）
+    // 大型服务器（16+核）：64KB（高性能）
+    let num_cpus = num_cpus::get();
+    let buffer_size = if num_cpus <= 2 {
+        16384  // 16KB
+    } else if num_cpus <= 8 {
+        32768  // 32KB
+    } else {
+        65536  // 64KB
+    };
+    let mut buffer = vec![0u8; buffer_size];
 
-    // ⚡ 优化：读取 Client Hello 超时设置为 3 秒
+    // ⚡ 自适应超时配置：根据服务器规模调整
+    // 小型服务器：更短超时，快速失败，节省资源
+    // 大型服务器：更长超时，容忍网络抖动
+    let read_timeout_secs = if num_cpus <= 2 {
+        2  // 小型服务器：2秒
+    } else if num_cpus <= 8 {
+        3  // 中型服务器：3秒
+    } else {
+        5  // 大型服务器：5秒
+    };
+
+    // ⚡ 优化：读取 Client Hello 超时自适应
     let read_start = Instant::now();
-    let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
+    let n = match timeout(Duration::from_secs(read_timeout_secs), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
@@ -577,9 +624,18 @@ async fn handle_connection(
     } else {
         // 直接连接
         let target_addr = format!("{}:443", sni);
-        // ⚡ 优化：连接超时设置为 5 秒
+
+        // ⚡ 自适应连接超时：根据服务器规模调整
+        let connect_timeout_secs = if num_cpus <= 2 {
+            3  // 小型服务器：3秒（快速失败）
+        } else if num_cpus <= 8 {
+            5  // 中型服务器：5秒
+        } else {
+            8  // 大型服务器：8秒（容忍慢网络）
+        };
+
         match timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(connect_timeout_secs),
             TcpStream::connect(&target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
