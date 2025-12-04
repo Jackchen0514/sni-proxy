@@ -120,22 +120,141 @@ impl Default for LogConfigFile {
     }
 }
 
+/// 验证配置的有效性
+fn validate_config(config: &Config) -> Result<()> {
+    // 验证监听地址
+    config
+        .listen_addr
+        .parse::<SocketAddr>()
+        .context("无效的监听地址格式")?;
+
+    // 验证白名单不能为空
+    if config.whitelist.is_empty() && config.socks5_whitelist.is_empty() {
+        anyhow::bail!("直连白名单和 SOCKS5 白名单不能同时为空");
+    }
+
+    // 验证 SOCKS5 配置
+    if let Some(ref socks5) = config.socks5 {
+        socks5
+            .addr
+            .parse::<SocketAddr>()
+            .context("无效的 SOCKS5 代理地址格式")?;
+
+        // 检查用户名和密码的一致性
+        if socks5.username.is_some() != socks5.password.is_some() {
+            anyhow::bail!("SOCKS5 用户名和密码必须同时提供或同时省略");
+        }
+    }
+
+    // 验证 IP 流量追踪配置
+    if let Some(ref tracking) = config.ip_traffic_tracking {
+        if tracking.enabled {
+            // 验证 max_tracked_ips 合理性
+            if tracking.max_tracked_ips == 0 {
+                anyhow::bail!("IP 流量追踪的 max_tracked_ips 必须大于 0");
+            }
+            if tracking.max_tracked_ips > 1_000_000 {
+                log::warn!("⚠️  max_tracked_ips 设置过大 ({})，可能占用大量内存", tracking.max_tracked_ips);
+            }
+
+            // 验证输出文件路径可写
+            if let Some(ref output_file) = tracking.output_file {
+                if let Some(parent) = std::path::Path::new(output_file).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  输出文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建输出文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+
+            // 验证持久化文件路径可写
+            if let Some(ref persistence_file) = tracking.persistence_file {
+                if let Some(parent) = std::path::Path::new(persistence_file).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  持久化文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建持久化文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // 验证日志配置
+    if let Some(ref log_config) = config.log {
+        // 验证日志级别
+        let valid_levels = ["off", "error", "warn", "info", "debug", "trace"];
+        if !valid_levels.contains(&log_config.level.as_str()) {
+            anyhow::bail!(
+                "无效的日志级别: {}，有效值: {:?}",
+                log_config.level,
+                valid_levels
+            );
+        }
+
+        // 验证日志输出
+        let valid_outputs = ["stdout", "file", "both"];
+        if !valid_outputs.contains(&log_config.output.as_str()) {
+            anyhow::bail!(
+                "无效的日志输出: {}，有效值: {:?}",
+                log_config.output,
+                valid_outputs
+            );
+        }
+
+        // 如果输出到文件，验证文件路径
+        if log_config.output == "file" || log_config.output == "both" {
+            if log_config.file_path.is_none() {
+                log::warn!("⚠️  日志输出到文件但未指定路径，将使用默认路径: logs/sni-proxy.log");
+            } else if let Some(ref file_path) = log_config.file_path {
+                if let Some(parent) = std::path::Path::new(file_path).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  日志文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建日志文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+        }
+
+        // 验证日志轮转配置
+        if log_config.enable_rotation {
+            if log_config.max_size_mb == 0 {
+                anyhow::bail!("启用日志轮转时，max_size_mb 必须大于 0");
+            }
+            if log_config.max_backups == 0 {
+                log::warn!("⚠️  max_backups 为 0，日志文件将不保留备份");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // ⚡ 性能优化：自定义 Tokio 运行时配置
+    // 小型服务器优化（<= 2核）：使用 CPU 核心数作为工作线程数
+    // 大型服务器优化（> 2核）：使用 CPU 核心数的一半
+    let num_cpus = num_cpus::get();
+    let worker_threads = if num_cpus <= 2 {
+        num_cpus  // 小型服务器：使用所有核心
+    } else {
+        std::cmp::max(4, num_cpus / 2)  // 大型服务器：使用一半
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        // 工作线程数：使用 CPU 核心数
-        // 对于流媒体场景，建议设置为 CPU 核心数以充分利用 CPU
-        .worker_threads(num_cpus::get())
+        // 工作线程数：根据 CPU 核心数自适应
+        .worker_threads(worker_threads)
         // 线程命名：便于调试和监控
         .thread_name("sni-proxy-worker")
-        // 线程栈大小：2MB（适合高并发场景）
-        .thread_stack_size(2 * 1024 * 1024)
+        // 使用默认栈大小（约 512KB-1MB，节省内存）
         // 启用所有 Tokio 功能（I/O、时间、信号等）
         .enable_all()
         // 全局队列间隔：31（默认值，平衡公平性和性能）
         .global_queue_interval(31)
-        // 事件间隔：61（减少系统调用频率）
-        .event_interval(61)
+        // 事件间隔：小型服务器使用 61 减少 CPU 开销
+        .event_interval(if num_cpus <= 2 { 61 } else { 31 })
         .build()
         .context("创建 Tokio 运行时失败")?;
 
@@ -155,6 +274,10 @@ async fn async_main() -> Result<()> {
 
     let config: Config = serde_json::from_str(&config_content)
         .context("解析配置文件失败")?;
+
+    // 验证配置
+    validate_config(&config)
+        .context("配置验证失败")?;
 
     // 初始化日志系统
     let log_config_file = config.log.unwrap_or_default();
@@ -216,11 +339,21 @@ async fn async_main() -> Result<()> {
     // ⚡ 显示运行时配置
     let num_cpus = num_cpus::get();
     let num_physical_cpus = num_cpus::get_physical();
+    let worker_threads = if num_cpus <= 2 {
+        num_cpus
+    } else {
+        std::cmp::max(4, num_cpus / 2)
+    };
+    let event_interval = if num_cpus <= 2 { 61 } else { 31 };
+
     log::info!("🚀 Tokio 运行时配置:");
-    log::info!("  工作线程数: {} (CPU 核心: {} 物理, {} 逻辑)", num_cpus, num_physical_cpus, num_cpus);
-    log::info!("  线程栈大小: 2 MB");
-    log::info!("  全局队列间隔: 31 (任务公平性)");
-    log::info!("  事件间隔: 61 (减少系统调用)");
+    log::info!("  CPU 核心: {} 物理, {} 逻辑", num_physical_cpus, num_cpus);
+    log::info!("  工作线程数: {} ({})", worker_threads,
+        if num_cpus <= 2 { "小型服务器模式" } else { "大型服务器模式" });
+    log::info!("  线程栈大小: 默认 (~1MB)");
+    log::info!("  全局队列间隔: 31");
+    log::info!("  事件间隔: {} ({})", event_interval,
+        if num_cpus <= 2 { "节省 CPU" } else { "I/O 优化" });
 
     let listen_addr: SocketAddr = config
         .listen_addr
@@ -342,8 +475,57 @@ async fn async_main() -> Result<()> {
 
     log::info!("=== 服务器准备就绪 ===");
 
-    // 启动代理
-    proxy.run().await?;
+    // 创建优雅关闭信号通道
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // 启动信号监听任务
+    tokio::spawn(async move {
+        use tokio::signal;
+
+        // 监听 SIGTERM (kill 默认信号)
+        #[cfg(unix)]
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("创建 SIGTERM 信号监听失败");
+
+        // 监听 SIGINT (Ctrl+C)
+        let sigint = signal::ctrl_c();
+
+        // 监听 SIGQUIT (Ctrl+\)
+        #[cfg(unix)]
+        let mut sigquit = signal::unix::signal(signal::unix::SignalKind::quit())
+            .expect("创建 SIGQUIT 信号监听失败");
+
+        #[cfg(unix)]
+        tokio::select! {
+            _ = sigterm.recv() => {
+                log::info!("🛑 收到 SIGTERM 信号");
+            }
+            _ = sigint => {
+                log::info!("🛑 收到 SIGINT (Ctrl+C) 信号");
+            }
+            _ = sigquit.recv() => {
+                log::info!("🛑 收到 SIGQUIT (Ctrl+\\) 信号");
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = sigint.await;
+            log::info!("🛑 收到 Ctrl+C 信号");
+        }
+
+        log::info!("🛑 正在优雅关闭服务器...");
+
+        // 发送关闭信号
+        if let Err(e) = shutdown_tx.send(true) {
+            log::error!("发送关闭信号失败: {}", e);
+        }
+    });
+
+    // 启动代理（支持优雅关闭）
+    proxy.run_with_shutdown(Some(shutdown_rx)).await?;
+
+    log::info!("=== 服务器已关闭 ===");
 
     Ok(())
 }

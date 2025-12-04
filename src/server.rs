@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::FutureExt;
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+use tokio::sync::watch;
 
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
@@ -122,7 +124,18 @@ impl SniProxy {
     }
 
     /// 启动代理服务器
+    ///
+    /// # 参数
+    /// * `shutdown_rx` - 可选的关闭信号接收器，用于优雅关闭
     pub async fn run(&self) -> Result<()> {
+        self.run_with_shutdown(None).await
+    }
+
+    /// 启动代理服务器（支持优雅关闭）
+    ///
+    /// # 参数
+    /// * `shutdown_rx` - 可选的关闭信号接收器
+    pub async fn run_with_shutdown(&self, mut shutdown_rx: Option<watch::Receiver<bool>>) -> Result<()> {
         // 创建 socket 并设置选项
         use socket2::{Domain, Protocol, Socket, Type};
 
@@ -242,72 +255,188 @@ impl SniProxy {
                 }
             });
             info!("✅ IP 流量追踪已启用");
+
+            // 启动后台任务：每 5 分钟保存一次持久化数据
+            let ip_traffic_tracker_clone = self.ip_traffic_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 分钟
+                loop {
+                    interval.tick().await;
+                    info!("💾 定期保存 IP 流量统计数据...");
+                    ip_traffic_tracker_clone.save_to_persistence_file();
+                }
+            });
+            info!("✅ IP 流量追踪定期保存已启用（每 5 分钟）");
         }
 
         loop {
             use std::time::Instant;
 
-            // ⏱️ 测量 accept 耗时
-            let accept_start = Instant::now();
-            match listener.accept().await {
-                Ok((client_stream, client_addr)) => {
-                    let accept_elapsed = accept_start.elapsed();
+            // 如果提供了关闭信号，使用 select! 监听关闭和新连接
+            let should_shutdown = if let Some(ref mut rx) = shutdown_rx {
+                tokio::select! {
+                    // 监听关闭信号
+                    _ = rx.changed() => {
+                        if *rx.borrow() {
+                            info!("🛑 收到关闭信号，停止接受新连接");
+                            // 等待活跃连接完成（最多 30 秒）
+                            info!("⏳ 等待活跃连接完成...");
+                            let wait_start = Instant::now();
 
-                    // ⏱️ 测量获取 permit 耗时
-                    let permit_start = Instant::now();
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!("获取连接许可失败: {}", e);
-                            continue;
+                            // 使用循环检查活跃连接数
+                            for _ in 0..30 {
+                                let active = self.metrics.get_active_connections();
+                                if active == 0 {
+                                    info!("✅ 所有连接已关闭");
+                                    break;
+                                }
+                                info!("⏳ 等待 {} 个活跃连接关闭...", active);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+
+                            let final_active = self.metrics.get_active_connections();
+                            if final_active > 0 {
+                                warn!("⚠️  超时：仍有 {} 个连接未关闭，强制退出", final_active);
+                            }
+
+                            info!("⏱️  关闭耗时: {:?}", wait_start.elapsed());
+
+                            // 保存 IP 流量统计数据
+                            if self.ip_traffic_tracker.is_enabled() {
+                                info!("💾 保存 IP 流量统计数据...");
+                                self.ip_traffic_tracker.save_to_persistence_file();
+                            }
+
+                            // 打印最终统计
+                            info!("📊 最终统计:");
+                            self.metrics.print_summary();
+
+                            return Ok(());
                         }
-                    };
-                    let permit_elapsed = permit_start.elapsed();
-
-                    // 只在慢的时候打印警告
-                    if accept_elapsed.as_millis() > 100 {
-                        warn!("⏱️  接受连接慢: {}ms (来自 {})", accept_elapsed.as_millis(), client_addr);
+                        false
                     }
-                    if permit_elapsed.as_millis() > 10 {
-                        debug!("⏱️  等待许可: {}ms", permit_elapsed.as_millis());
+                    // 监听新连接
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((client_stream, client_addr)) => {
+                                handle_new_connection(
+                                    client_stream,
+                                    client_addr,
+                                    &semaphore,
+                                    &self,
+                                    Instant::now(),
+                                ).await;
+                                false
+                            }
+                            Err(e) => {
+                                error!("接受连接失败: {}", e);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                false
+                            }
+                        }
                     }
-
-                    debug!("接受来自 {} 的新连接 (accept: {:?}, permit: {:?})",
-                           client_addr, accept_elapsed, permit_elapsed);
-
-                    let direct_matcher = Arc::clone(&self.direct_matcher);
-                    let socks5_matcher = self.socks5_matcher.clone();
-                    let ip_matcher = self.ip_matcher.clone();
-                    let socks5_config = self.socks5_config.clone();
-                    let metrics = self.metrics.clone();
-                    let ip_traffic_tracker = self.ip_traffic_tracker.clone();
-
-                    tokio::spawn(async move {
-                        // 持有许可直到连接处理完成
-                        let _permit = permit;
-
-                        if let Err(e) = handle_connection(
+                }
+            } else {
+                // 没有关闭信号，直接 accept
+                match listener.accept().await {
+                    Ok((client_stream, client_addr)) => {
+                        handle_new_connection(
                             client_stream,
                             client_addr,
-                            direct_matcher,
-                            socks5_matcher,
-                            ip_matcher,
-                            socks5_config,
-                            metrics,
-                            ip_traffic_tracker
-                        ).await {
-                            debug!("处理连接时出错: {}", e);
-                        }
-                    });
+                            &semaphore,
+                            &self,
+                            Instant::now(),
+                        ).await;
+                        false
+                    }
+                    Err(e) => {
+                        error!("接受连接失败: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        false
+                    }
                 }
-                Err(e) => {
-                    error!("接受连接失败: {}", e);
-                    // 短暂休眠避免繁忙循环
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+            };
+
+            if should_shutdown {
+                break;
             }
         }
+
+        Ok(())
     }
+}
+
+/// 处理新连接的辅助函数
+async fn handle_new_connection(
+    client_stream: TcpStream,
+    client_addr: SocketAddr,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    proxy: &SniProxy,
+    accept_start: std::time::Instant,
+) {
+    let accept_elapsed = accept_start.elapsed();
+
+    // ⏱️ 测量获取 permit 耗时
+    let permit_start = std::time::Instant::now();
+    let permit = match semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("获取连接许可失败: {}", e);
+            return;
+        }
+    };
+    let permit_elapsed = permit_start.elapsed();
+
+    // 只在慢的时候打印警告
+    if accept_elapsed.as_millis() > 100 {
+        warn!("⏱️  接受连接慢: {}ms (来自 {})", accept_elapsed.as_millis(), client_addr);
+    }
+    if permit_elapsed.as_millis() > 10 {
+        debug!("⏱️  等待许可: {}ms", permit_elapsed.as_millis());
+    }
+
+    debug!("接受来自 {} 的新连接 (accept: {:?}, permit: {:?})",
+           client_addr, accept_elapsed, permit_elapsed);
+
+    let direct_matcher = Arc::clone(&proxy.direct_matcher);
+    let socks5_matcher = proxy.socks5_matcher.clone();
+    let ip_matcher = proxy.ip_matcher.clone();
+    let socks5_config = proxy.socks5_config.clone();
+    let metrics = proxy.metrics.clone();
+    let ip_traffic_tracker = proxy.ip_traffic_tracker.clone();
+
+    // 使用 catch_unwind 捕获 panic
+    tokio::spawn(async move {
+        // 持有许可直到连接处理完成
+        let _permit = permit;
+
+        // 捕获 panic 以防止任务崩溃
+        let result = std::panic::AssertUnwindSafe(handle_connection(
+            client_stream,
+            client_addr,
+            direct_matcher,
+            socks5_matcher,
+            ip_matcher,
+            socks5_config,
+            metrics.clone(),
+            ip_traffic_tracker,
+        ))
+        .catch_unwind()
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                // 连接正常完成
+            }
+            Ok(Err(e)) => {
+                debug!("处理连接时出错: {}", e);
+            }
+            Err(panic_err) => {
+                error!("❌ 连接处理任务 panic: {:?}", panic_err);
+                metrics.inc_failed_connections();
+            }
+        }
+    });
 }
 
 /// 处理单个客户端连接
