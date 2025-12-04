@@ -522,9 +522,20 @@ async fn handle_connection(
     };
     let mut buffer = vec![0u8; buffer_size];
 
-    // ⚡ 优化：读取 Client Hello 超时设置为 3 秒
+    // ⚡ 自适应超时配置：根据服务器规模调整
+    // 小型服务器：更短超时，快速失败，节省资源
+    // 大型服务器：更长超时，容忍网络抖动
+    let read_timeout_secs = if num_cpus <= 2 {
+        2  // 小型服务器：2秒
+    } else if num_cpus <= 8 {
+        3  // 中型服务器：3秒
+    } else {
+        5  // 大型服务器：5秒
+    };
+
+    // ⚡ 优化：读取 Client Hello 超时自适应
     let read_start = Instant::now();
-    let n = match timeout(Duration::from_secs(3), client_stream.read(&mut buffer)).await {
+    let n = match timeout(Duration::from_secs(read_timeout_secs), client_stream.read(&mut buffer)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
@@ -613,9 +624,18 @@ async fn handle_connection(
     } else {
         // 直接连接
         let target_addr = format!("{}:443", sni);
-        // ⚡ 优化：连接超时设置为 5 秒
+
+        // ⚡ 自适应连接超时：根据服务器规模调整
+        let connect_timeout_secs = if num_cpus <= 2 {
+            3  // 小型服务器：3秒（快速失败）
+        } else if num_cpus <= 8 {
+            5  // 中型服务器：5秒
+        } else {
+            8  // 大型服务器：8秒（容忍慢网络）
+        };
+
         match timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(connect_timeout_secs),
             TcpStream::connect(&target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
