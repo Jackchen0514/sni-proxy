@@ -120,8 +120,30 @@ impl Default for LogConfigFile {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // ⚡ 性能优化：自定义 Tokio 运行时配置
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        // 工作线程数：使用 CPU 核心数
+        // 对于流媒体场景，建议设置为 CPU 核心数以充分利用 CPU
+        .worker_threads(num_cpus::get())
+        // 线程命名：便于调试和监控
+        .thread_name("sni-proxy-worker")
+        // 线程栈大小：2MB（适合高并发场景）
+        .thread_stack_size(2 * 1024 * 1024)
+        // 启用所有 Tokio 功能（I/O、时间、信号等）
+        .enable_all()
+        // 全局队列间隔：31（默认值，平衡公平性和性能）
+        .global_queue_interval(31)
+        // 事件间隔：61（减少系统调用频率）
+        .event_interval(61)
+        .build()
+        .context("创建 Tokio 运行时失败")?;
+
+    // 在运行时中执行主逻辑
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // 读取配置文件路径（命令行参数或默认值）
     let config_path = std::env::args()
         .nth(1)
@@ -190,6 +212,15 @@ async fn main() -> Result<()> {
 
     log::info!("=== SNI 代理服务器启动 ===");
     log::info!("配置文件: {}", config_path);
+
+    // ⚡ 显示运行时配置
+    let num_cpus = num_cpus::get();
+    let num_physical_cpus = num_cpus::get_physical();
+    log::info!("🚀 Tokio 运行时配置:");
+    log::info!("  工作线程数: {} (CPU 核心: {} 物理, {} 逻辑)", num_cpus, num_physical_cpus, num_cpus);
+    log::info!("  线程栈大小: 2 MB");
+    log::info!("  全局队列间隔: 31 (任务公平性)");
+    log::info!("  事件间隔: 61 (减少系统调用)");
 
     let listen_addr: SocketAddr = config
         .listen_addr
