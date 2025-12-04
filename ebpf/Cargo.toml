@@ -1,0 +1,28 @@
+[package]
+name = "sni-proxy-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-bpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[features]
+default = []
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = false
+panic = "abort"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[[bin]]
+name = "sni-proxy"
+path = "src/main.rs"

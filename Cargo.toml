@@ -17,3 +17,13 @@ libc = "0.2.177"
 socket2 = "0.5"
 num_cpus = "1.16"
 futures = "0.3"
+
+# eBPF 依赖（可选，用于高性能加速）
+# 取消注释以启用 eBPF 功能
+# aya = { version = "0.12", optional = true }
+# aya-log = { version = "0.2", optional = true }
+
+[features]
+default = []
+# 取消注释以启用 eBPF 功能
+# ebpf = ["aya", "aya-log"]
