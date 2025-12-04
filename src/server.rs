@@ -11,6 +11,7 @@ use tokio::sync::watch;
 
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
+use crate::domain_ip_tracker::DomainIpTracker;
 use crate::ip_matcher::IpMatcher;
 use crate::ip_traffic::IpTrafficTracker;
 use crate::metrics::{ConnectionGuard, Metrics};
@@ -36,6 +37,8 @@ pub struct SniProxy {
     metrics: Metrics,
     /// IP 流量追踪器
     ip_traffic_tracker: IpTrafficTracker,
+    /// 域名-IP 追踪器
+    domain_ip_tracker: DomainIpTracker,
 }
 
 impl SniProxy {
@@ -66,6 +69,7 @@ impl SniProxy {
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
+            domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
         }
     }
 
@@ -101,6 +105,7 @@ impl SniProxy {
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
+            domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
         }
     }
 
@@ -139,6 +144,15 @@ impl SniProxy {
         persistence_file: Option<String>,
     ) -> Self {
         self.ip_traffic_tracker = IpTrafficTracker::new(max_tracked_ips, output_file, persistence_file);
+        self
+    }
+
+    /// 启用域名-IP 追踪（记录所有通过的域名及其解析的 IP）
+    ///
+    /// # 参数
+    /// * `output_file` - 输出文件路径（可选）
+    pub fn with_domain_ip_tracking(mut self, output_file: Option<String>) -> Self {
+        self.domain_ip_tracker = DomainIpTracker::new(output_file);
         self
     }
 
@@ -233,87 +247,6 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
-        // ⚡ 延迟优化：智能 DNS 缓存预热
-        // 根据服务器规模和白名单决定预热策略
-        let num_cpus = num_cpus::get();
-        info!("🔥 预热 DNS 缓存...");
-
-        let mut warmup_domains = Vec::new();
-
-        // 1. 获取所有域名模式（直连 + SOCKS5）
-        let mut all_patterns: Vec<String> = self.direct_matcher.get_patterns();
-        if let Some(ref socks5_matcher) = self.socks5_matcher {
-            all_patterns.extend(socks5_matcher.get_patterns());
-        }
-
-        // 2. 提取具体域名（非泛域名）
-        for domain in &all_patterns {
-            if !domain.starts_with('*') && !domain.contains('*') {
-                warmup_domains.push(domain.clone());
-            }
-        }
-
-        // 3. 对泛域名生成常见子域名
-        // *.example.com → www.example.com, api.example.com
-        for pattern in &all_patterns {
-            if pattern.starts_with("*.") {
-                let base_domain = &pattern[2..]; // 去掉 "*."
-
-                // 生成常用子域名
-                let subdomains = if num_cpus <= 2 {
-                    // 小型服务器：只预热最常用的
-                    vec!["www"]
-                } else {
-                    // 大型服务器：预热更多
-                    vec!["www", "api", "cdn", "static"]
-                };
-
-                for subdomain in subdomains {
-                    warmup_domains.push(format!("{}.{}", subdomain, base_domain));
-                }
-            }
-        }
-
-        // 4. 去重并限制数量
-        warmup_domains.sort();
-        warmup_domains.dedup();
-
-        let max_warmup = if num_cpus <= 2 {
-            10  // 小型服务器：最多预热 10 个
-        } else if num_cpus <= 8 {
-            20  // 中型服务器：最多预热 20 个
-        } else {
-            30  // 大型服务器：最多预热 30 个
-        };
-
-        warmup_domains.truncate(max_warmup);
-
-        if warmup_domains.is_empty() {
-            debug!("白名单中没有具体域名，跳过 DNS 预热");
-        } else {
-            info!("准备预热 {} 个域名...", warmup_domains.len());
-
-            // 并发预热所有域名
-            let warmup_tasks: Vec<_> = warmup_domains
-                .into_iter()
-                .map(|domain| async move {
-                    match resolve_host_cached(&domain).await {
-                        Ok(ips) => debug!("✅ DNS 预热成功: {} → {:?}", domain, ips.first()),
-                        Err(e) => debug!("⚠️  DNS 预热失败 {}: {}", domain, e),
-                    }
-                })
-                .collect();
-
-            // 并行执行所有预热任务（最多等待 3 秒）
-            let warmup_start = std::time::Instant::now();
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                futures::future::join_all(warmup_tasks)
-            ).await.ok();
-
-            info!("✅ DNS 缓存预热完成 (耗时: {:?})", warmup_start.elapsed());
-        }
-
         if let Some(socks5) = &self.socks5_config {
             info!("使用 SOCKS5 出口: {}", socks5.addr);
             if socks5.username.is_some() {
@@ -361,6 +294,33 @@ impl SniProxy {
             info!("✅ IP 流量追踪定期保存已启用（每 5 分钟）");
         }
 
+        // 启动后台任务：每分钟打印域名-IP 统计（仅在启用时）
+        if self.domain_ip_tracker.is_enabled() {
+            let domain_ip_tracker_clone = self.domain_ip_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    domain_ip_tracker_clone.print_summary();
+                }
+            });
+            info!("✅ 域名-IP 追踪已启用");
+
+            // 启动后台任务：每 5 分钟保存一次域名-IP 映射
+            let domain_ip_tracker_clone = self.domain_ip_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 分钟
+                loop {
+                    interval.tick().await;
+                    info!("💾 定期保存域名-IP 映射数据...");
+                    if let Err(e) = domain_ip_tracker_clone.save_to_file() {
+                        error!("保存域名-IP 映射失败: {}", e);
+                    }
+                }
+            });
+            info!("✅ 域名-IP 追踪定期保存已启用（每 5 分钟）");
+        }
+
         loop {
             use std::time::Instant;
 
@@ -397,6 +357,14 @@ impl SniProxy {
                             if self.ip_traffic_tracker.is_enabled() {
                                 info!("💾 保存 IP 流量统计数据...");
                                 self.ip_traffic_tracker.save_to_persistence_file();
+                            }
+
+                            // 保存域名-IP 映射数据
+                            if self.domain_ip_tracker.is_enabled() {
+                                info!("💾 保存域名-IP 映射数据...");
+                                if let Err(e) = self.domain_ip_tracker.save_to_file() {
+                                    error!("保存域名-IP 映射失败: {}", e);
+                                }
                             }
 
                             // 打印最终统计
@@ -496,6 +464,7 @@ async fn handle_new_connection(
     let socks5_config = proxy.socks5_config.clone();
     let metrics = proxy.metrics.clone();
     let ip_traffic_tracker = proxy.ip_traffic_tracker.clone();
+    let domain_ip_tracker = proxy.domain_ip_tracker.clone();
 
     // 使用 catch_unwind 捕获 panic
     tokio::spawn(async move {
@@ -512,6 +481,7 @@ async fn handle_new_connection(
             socks5_config,
             metrics.clone(),
             ip_traffic_tracker,
+            domain_ip_tracker,
         ))
         .catch_unwind()
         .await;
@@ -544,6 +514,7 @@ async fn handle_connection(
     socks5_config: Option<Arc<Socks5Config>>,
     metrics: Metrics,
     ip_traffic_tracker: IpTrafficTracker,
+    domain_ip_tracker: DomainIpTracker,
 ) -> Result<()> {
     use std::time::Instant;
     let start_time = Instant::now();
@@ -692,7 +663,21 @@ async fn handle_connection(
         }
     } else {
         // 直接连接
-        let target_addr = format!("{}:443", sni);
+        // ⚡ 先解析 DNS，获取 IP 地址，用于域名-IP 追踪
+        let resolved_ips = match resolve_host_cached(&sni).await {
+            Ok(ips) => {
+                // 记录域名和所有解析出的 IP
+                for ip in &ips {
+                    domain_ip_tracker.record(&sni, *ip);
+                }
+                ips
+            },
+            Err(e) => {
+                error!("DNS 解析失败 {}: {}", sni, e);
+                metrics.inc_failed_connections();
+                return Ok(());
+            }
+        };
 
         // ⚡ 自适应连接超时：根据服务器规模调整
         let connect_timeout_secs = if num_cpus <= 2 {
@@ -703,18 +688,20 @@ async fn handle_connection(
             8  // 大型服务器：8秒（容忍慢网络）
         };
 
+        // 尝试连接到第一个 IP
+        let target_addr = (resolved_ips[0], 443);
         match timeout(
             Duration::from_secs(connect_timeout_secs),
-            TcpStream::connect(&target_addr)
+            TcpStream::connect(target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                error!("连接到目标服务器 {} 失败: {}", target_addr, e);
+                error!("连接到目标服务器 {}:{} 失败: {}", resolved_ips[0], 443, e);
                 metrics.inc_failed_connections();
                 return Ok(());
             }
             Err(_) => {
-                error!("连接到目标服务器 {} 超时", target_addr);
+                error!("连接到目标服务器 {}:{} 超时", resolved_ips[0], 443);
                 metrics.inc_connection_timeouts();
                 metrics.inc_failed_connections();
                 return Ok(());
