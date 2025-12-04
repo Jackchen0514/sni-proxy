@@ -233,17 +233,53 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
-        // ⚡ 预热：预解析热门域名的 DNS（仅用于直连模式）
+        // ⚡ 延迟优化：预热 DNS 缓存
+        // 根据服务器规模决定预热策略
+        let num_cpus = num_cpus::get();
         if self.socks5_config.is_none() {
-            info!("预热 DNS 缓存...");
-            let common_domains = vec!["claude.ai", "www.netflix.com", "api.anthropic.com"];
-            for domain in common_domains {
-                if let Err(e) = resolve_host_cached(domain).await {
-                    debug!("预热 DNS 失败 {}: {}", domain, e);
-                } else {
-                    debug!("预热 DNS 成功: {}", domain);
-                }
-            }
+            info!("🔥 预热 DNS 缓存...");
+
+            // 预热域名列表（常用流媒体和服务）
+            let warmup_domains = if num_cpus <= 2 {
+                // 小型服务器：只预热最常用的
+                vec![
+                    "www.netflix.com",
+                    "www.youtube.com",
+                    "api.openai.com",
+                ]
+            } else {
+                // 大型服务器：预热更多域名
+                vec![
+                    "www.netflix.com",
+                    "www.youtube.com",
+                    "api.openai.com",
+                    "claude.ai",
+                    "api.anthropic.com",
+                    "www.google.com",
+                    "github.com",
+                    "www.cloudflare.com",
+                ]
+            };
+
+            // 并发预热所有域名
+            let warmup_tasks: Vec<_> = warmup_domains
+                .into_iter()
+                .map(|domain| async move {
+                    match resolve_host_cached(domain).await {
+                        Ok(_) => debug!("✅ DNS 预热成功: {}", domain),
+                        Err(e) => debug!("⚠️  DNS 预热失败 {}: {}", domain, e),
+                    }
+                })
+                .collect();
+
+            // 并行执行所有预热任务（最多等待 2 秒）
+            let warmup_start = std::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                futures::future::join_all(warmup_tasks)
+            ).await.ok();
+
+            info!("✅ DNS 缓存预热完成 (耗时: {:?})", warmup_start.elapsed());
         }
 
         if let Some(socks5) = &self.socks5_config {
@@ -573,14 +609,15 @@ async fn handle_connection(
     };
 
     // 检查白名单并决定连接方式
+    // ⚡ 延迟优化：减少热路径日志，只在 debug 模式或失败时输出
     let use_socks5 = if let Some(ref socks5_matcher) = socks5_matcher {
         // 优先检查 SOCKS5 白名单
         if socks5_matcher.matches(&sni) {
-            info!("域名 {} 匹配 SOCKS5 白名单", sni);
+            debug!("域名 {} 匹配 SOCKS5 白名单", sni);
             metrics.inc_socks5_requests();
             true
         } else if direct_matcher.matches(&sni) {
-            info!("域名 {} 匹配直连白名单", sni);
+            debug!("域名 {} 匹配直连白名单", sni);
             metrics.inc_direct_requests();
             false
         } else {
@@ -592,7 +629,7 @@ async fn handle_connection(
     } else {
         // 如果没有 SOCKS5 白名单，只检查直连白名单
         if direct_matcher.matches(&sni) {
-            info!("域名 {} 匹配白名单，使用直连", sni);
+            debug!("域名 {} 匹配白名单，使用直连", sni);
             metrics.inc_direct_requests();
             false
         } else {
@@ -608,10 +645,10 @@ async fn handle_connection(
     let target_stream = if use_socks5 && socks5_config.is_some() {
         // 通过 SOCKS5 连接
         let socks5 = socks5_config.as_ref().unwrap();
-        info!("通过 SOCKS5 连接到 {}:443", sni);
+        debug!("通过 SOCKS5 连接到 {}:443", sni);
         match connect_via_socks5(&sni, 443, socks5.as_ref()).await {
             Ok(stream) => {
-                info!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
+                debug!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
                 stream
             },
             Err(e) => {
@@ -657,7 +694,8 @@ async fn handle_connection(
     let mut target_stream = target_stream;
     let _ = crate::proxy::optimize_tcp_for_streaming(&target_stream);
 
-    debug!("成功连接到目标服务器 {}:443", sni);
+    // ⚡ 延迟优化：只在 debug 模式记录成功连接
+    debug!("✅ 连接到 {}:443 成功 (耗时: {:?})", sni, connect_start.elapsed());
 
     // 转发 Client Hello
     if let Err(e) = target_stream.write_all(&buffer).await {
@@ -679,7 +717,8 @@ async fn handle_connection(
         debug!("数据转发结束: {}", e);
     }
 
-    info!("⏱️  {} 总耗时: {:?} (连接: {:?}, 转发: {:?})",
+    // ⚡ 延迟优化：性能统计只在 debug 模式输出
+    debug!("⏱️  {} 总耗时: {:?} (连接: {:?}, 转发: {:?})",
           sni,
           start_time.elapsed(),
           connect_start.elapsed(),
