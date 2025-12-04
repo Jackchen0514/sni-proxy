@@ -120,6 +120,118 @@ impl Default for LogConfigFile {
     }
 }
 
+/// 验证配置的有效性
+fn validate_config(config: &Config) -> Result<()> {
+    // 验证监听地址
+    config
+        .listen_addr
+        .parse::<SocketAddr>()
+        .context("无效的监听地址格式")?;
+
+    // 验证白名单不能为空
+    if config.whitelist.is_empty() && config.socks5_whitelist.is_empty() {
+        anyhow::bail!("直连白名单和 SOCKS5 白名单不能同时为空");
+    }
+
+    // 验证 SOCKS5 配置
+    if let Some(ref socks5) = config.socks5 {
+        socks5
+            .addr
+            .parse::<SocketAddr>()
+            .context("无效的 SOCKS5 代理地址格式")?;
+
+        // 检查用户名和密码的一致性
+        if socks5.username.is_some() != socks5.password.is_some() {
+            anyhow::bail!("SOCKS5 用户名和密码必须同时提供或同时省略");
+        }
+    }
+
+    // 验证 IP 流量追踪配置
+    if let Some(ref tracking) = config.ip_traffic_tracking {
+        if tracking.enabled {
+            // 验证 max_tracked_ips 合理性
+            if tracking.max_tracked_ips == 0 {
+                anyhow::bail!("IP 流量追踪的 max_tracked_ips 必须大于 0");
+            }
+            if tracking.max_tracked_ips > 1_000_000 {
+                log::warn!("⚠️  max_tracked_ips 设置过大 ({})，可能占用大量内存", tracking.max_tracked_ips);
+            }
+
+            // 验证输出文件路径可写
+            if let Some(ref output_file) = tracking.output_file {
+                if let Some(parent) = std::path::Path::new(output_file).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  输出文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建输出文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+
+            // 验证持久化文件路径可写
+            if let Some(ref persistence_file) = tracking.persistence_file {
+                if let Some(parent) = std::path::Path::new(persistence_file).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  持久化文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建持久化文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // 验证日志配置
+    if let Some(ref log_config) = config.log {
+        // 验证日志级别
+        let valid_levels = ["off", "error", "warn", "info", "debug", "trace"];
+        if !valid_levels.contains(&log_config.level.as_str()) {
+            anyhow::bail!(
+                "无效的日志级别: {}，有效值: {:?}",
+                log_config.level,
+                valid_levels
+            );
+        }
+
+        // 验证日志输出
+        let valid_outputs = ["stdout", "file", "both"];
+        if !valid_outputs.contains(&log_config.output.as_str()) {
+            anyhow::bail!(
+                "无效的日志输出: {}，有效值: {:?}",
+                log_config.output,
+                valid_outputs
+            );
+        }
+
+        // 如果输出到文件，验证文件路径
+        if log_config.output == "file" || log_config.output == "both" {
+            if log_config.file_path.is_none() {
+                log::warn!("⚠️  日志输出到文件但未指定路径，将使用默认路径: logs/sni-proxy.log");
+            } else if let Some(ref file_path) = log_config.file_path {
+                if let Some(parent) = std::path::Path::new(file_path).parent() {
+                    if !parent.exists() {
+                        log::warn!("⚠️  日志文件目录不存在: {:?}，尝试创建...", parent);
+                        std::fs::create_dir_all(parent)
+                            .context(format!("无法创建日志文件目录: {:?}", parent))?;
+                    }
+                }
+            }
+        }
+
+        // 验证日志轮转配置
+        if log_config.enable_rotation {
+            if log_config.max_size_mb == 0 {
+                anyhow::bail!("启用日志轮转时，max_size_mb 必须大于 0");
+            }
+            if log_config.max_backups == 0 {
+                log::warn!("⚠️  max_backups 为 0，日志文件将不保留备份");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // ⚡ 性能优化：自定义 Tokio 运行时配置
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -155,6 +267,10 @@ async fn async_main() -> Result<()> {
 
     let config: Config = serde_json::from_str(&config_content)
         .context("解析配置文件失败")?;
+
+    // 验证配置
+    validate_config(&config)
+        .context("配置验证失败")?;
 
     // 初始化日志系统
     let log_config_file = config.log.unwrap_or_default();
@@ -342,8 +458,57 @@ async fn async_main() -> Result<()> {
 
     log::info!("=== 服务器准备就绪 ===");
 
-    // 启动代理
-    proxy.run().await?;
+    // 创建优雅关闭信号通道
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // 启动信号监听任务
+    tokio::spawn(async move {
+        use tokio::signal;
+
+        // 监听 SIGTERM (kill 默认信号)
+        #[cfg(unix)]
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("创建 SIGTERM 信号监听失败");
+
+        // 监听 SIGINT (Ctrl+C)
+        let sigint = signal::ctrl_c();
+
+        // 监听 SIGQUIT (Ctrl+\)
+        #[cfg(unix)]
+        let mut sigquit = signal::unix::signal(signal::unix::SignalKind::quit())
+            .expect("创建 SIGQUIT 信号监听失败");
+
+        #[cfg(unix)]
+        tokio::select! {
+            _ = sigterm.recv() => {
+                log::info!("🛑 收到 SIGTERM 信号");
+            }
+            _ = sigint => {
+                log::info!("🛑 收到 SIGINT (Ctrl+C) 信号");
+            }
+            _ = sigquit.recv() => {
+                log::info!("🛑 收到 SIGQUIT (Ctrl+\\) 信号");
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = sigint.await;
+            log::info!("🛑 收到 Ctrl+C 信号");
+        }
+
+        log::info!("🛑 正在优雅关闭服务器...");
+
+        // 发送关闭信号
+        if let Err(e) = shutdown_tx.send(true) {
+            log::error!("发送关闭信号失败: {}", e);
+        }
+    });
+
+    // 启动代理（支持优雅关闭）
+    proxy.run_with_shutdown(Some(shutdown_rx)).await?;
+
+    log::info!("=== 服务器已关闭 ===");
 
     Ok(())
 }

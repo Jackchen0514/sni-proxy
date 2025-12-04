@@ -261,7 +261,7 @@ impl IpTrafficTracker {
 
         // 保存到持久化文件（如果配置了）
         if let Some(ref path) = self.persistence_file {
-            if let Err(e) = self.save_to_persistence_file(path) {
+            if let Err(e) = self.save_to_persistence_file_internal(path) {
                 warn!("保存持久化数据失败: {}", e);
             }
         }
@@ -312,7 +312,7 @@ impl IpTrafficTracker {
     }
 
     /// 保存统计数据到持久化文件（JSON 格式）
-    fn save_to_persistence_file(&self, path: &str) -> std::io::Result<()> {
+    fn save_to_persistence_file_internal(&self, path: &str) -> std::io::Result<()> {
         use std::time::SystemTime;
 
         let inner = self.inner.lock().unwrap();
@@ -414,6 +414,21 @@ impl IpTrafficTracker {
     /// 检查是否启用
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// 手动保存持久化数据
+    pub fn save_to_persistence_file(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(ref path) = self.persistence_file {
+            if let Err(e) = self.save_to_persistence_file_internal(path) {
+                warn!("保存持久化数据失败: {}", e);
+            } else {
+                debug!("持久化数据已保存");
+            }
+        }
     }
 }
 
