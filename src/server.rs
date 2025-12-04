@@ -306,10 +306,10 @@ impl SniProxy {
             });
             info!("✅ 域名-IP 追踪已启用");
 
-            // 启动后台任务：每 5 分钟保存一次域名-IP 映射
+            // 启动后台任务：每 1 分钟保存一次域名-IP 映射
             let domain_ip_tracker_clone = self.domain_ip_tracker.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 分钟
+                let mut interval = tokio::time::interval(Duration::from_secs(60)); // 1 分钟
                 loop {
                     interval.tick().await;
                     info!("💾 定期保存域名-IP 映射数据...");
@@ -318,7 +318,7 @@ impl SniProxy {
                     }
                 }
             });
-            info!("✅ 域名-IP 追踪定期保存已启用（每 5 分钟）");
+            info!("✅ 域名-IP 追踪定期保存已启用（每 1 分钟）");
         }
 
         loop {
