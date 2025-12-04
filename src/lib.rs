@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod server;
 pub mod socks5;
 pub mod tls;
+pub mod ebpf;
 
 // 重新导出主要的公共类型和函数
 pub use dns::{clear_dns_cache, get_dns_cache_size, resolve_host_cached};
@@ -23,3 +24,4 @@ pub use proxy::proxy_data;
 pub use server::SniProxy;
 pub use socks5::{connect_via_socks5, Socks5Config};
 pub use tls::parse_sni;
+pub use ebpf::{EbpfManager, EbpfConfig, EbpfCapabilities, SockmapManager, EbpfDnsCache, EbpfStats};
