@@ -652,6 +652,8 @@ async fn handle_connection(
         match connect_via_socks5(&sni, 443, socks5.as_ref()).await {
             Ok(stream) => {
                 debug!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
+                // 记录通过 SOCKS5 的域名（无法获取实际解析的 IP）
+                domain_ip_tracker.record_socks5(&sni);
                 stream
             },
             Err(e) => {

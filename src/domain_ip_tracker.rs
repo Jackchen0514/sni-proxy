@@ -53,6 +53,21 @@ impl DomainIpTracker {
             .insert(ip);
     }
 
+    /// 记录仅域名（用于 SOCKS5 流量，无法获取实际 IP）
+    /// 使用 0.0.0.0 作为占位符表示通过 SOCKS5
+    pub fn record_socks5(&self, domain: &str) {
+        if !self.enabled {
+            return;
+        }
+
+        // 使用 0.0.0.0 作为 SOCKS5 流量的标记
+        let socks5_marker = "0.0.0.0".parse::<IpAddr>().unwrap();
+        let mut data = self.data.lock().unwrap();
+        data.entry(domain.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(socks5_marker);
+    }
+
     /// 获取统计信息
     pub fn get_stats(&self) -> (usize, usize) {
         let data = self.data.lock().unwrap();
@@ -89,20 +104,37 @@ impl DomainIpTracker {
         domains.sort();
 
         // 写入每个域名及其 IP 列表
+        let socks5_marker = "0.0.0.0".parse::<IpAddr>().unwrap();
         for domain in domains {
             if let Some(ips) = data.get(domain) {
                 // 将 IP 转换为 Vec 并排序
                 let mut ip_list: Vec<_> = ips.iter().collect();
                 ip_list.sort();
 
-                // 格式化输出
-                let ip_str = ip_list
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                // 检查是否只包含 SOCKS5 标记
+                if ip_list.len() == 1 && *ip_list[0] == socks5_marker {
+                    // SOCKS5 流量
+                    writeln!(file, "{} -> [SOCKS5]", domain)?;
+                } else {
+                    // 格式化输出，过滤掉 SOCKS5 标记
+                    let ip_str = ip_list
+                        .iter()
+                        .filter(|ip| ***ip != socks5_marker)
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
 
-                writeln!(file, "{} -> {}", domain, ip_str)?;
+                    if ip_str.is_empty() {
+                        // 只有 SOCKS5 标记（理论上不会到这里）
+                        writeln!(file, "{} -> [SOCKS5]", domain)?;
+                    } else if ips.contains(&socks5_marker) {
+                        // 既有直连 IP 又有 SOCKS5
+                        writeln!(file, "{} -> {} [也通过SOCKS5]", domain, ip_str)?;
+                    } else {
+                        // 仅直连 IP
+                        writeln!(file, "{} -> {}", domain, ip_str)?;
+                    }
+                }
             }
         }
 
