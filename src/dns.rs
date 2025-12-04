@@ -7,8 +7,21 @@ use std::num::NonZeroUsize;
 use tokio::sync::Mutex;
 
 lazy_static! {
-    static ref DNS_CACHE: Mutex<LruCache<String, Vec<IpAddr>>> =
-        Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap()));
+    // 🚀 自适应 DNS 缓存大小：根据 CPU 核心数调整
+    // 小型服务器（1-2核）：500 条
+    // 中型服务器（4-8核）：1000 条
+    // 大型服务器（16+核）：2000 条
+    static ref DNS_CACHE: Mutex<LruCache<String, Vec<IpAddr>>> = {
+        let num_cpus = num_cpus::get();
+        let cache_size = if num_cpus <= 2 {
+            500
+        } else if num_cpus <= 8 {
+            1000
+        } else {
+            2000
+        };
+        Mutex::new(LruCache::new(NonZeroUsize::new(cache_size).unwrap()))
+    };
 }
 
 /// 带缓存的 DNS 解析
