@@ -13,11 +13,13 @@
 pub mod sockmap;
 pub mod dns_cache;
 pub mod stats;
+pub mod xdp;
 pub mod manager;
 
 pub use sockmap::SockmapManager;
 pub use dns_cache::EbpfDnsCache;
 pub use stats::EbpfStats;
+pub use xdp::XdpManager;
 pub use manager::{EbpfManager, EbpfConfig};
 
 use anyhow::{Context, Result};
