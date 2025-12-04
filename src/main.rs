@@ -234,20 +234,26 @@ fn validate_config(config: &Config) -> Result<()> {
 
 fn main() -> Result<()> {
     // ⚡ 性能优化：自定义 Tokio 运行时配置
+    // 对于 I/O 密集型任务（流媒体代理），使用较少的工作线程
+    // 经验值：CPU 核心数的 1/2 到 1/4，最少 4 个
+    let num_cpus = num_cpus::get();
+    let worker_threads = std::cmp::max(4, num_cpus / 2);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        // 工作线程数：使用 CPU 核心数
-        // 对于流媒体场景，建议设置为 CPU 核心数以充分利用 CPU
-        .worker_threads(num_cpus::get())
+        // 工作线程数：CPU 核心数的一半（避免过度上下文切换）
+        .worker_threads(worker_threads)
         // 线程命名：便于调试和监控
         .thread_name("sni-proxy-worker")
+        // 使用默认栈大小（更小，约 512KB-1MB）
         // 线程栈大小：2MB（适合高并发场景）
-        .thread_stack_size(2 * 1024 * 1024)
+        // .thread_stack_size(2 * 1024 * 1024)
         // 启用所有 Tokio 功能（I/O、时间、信号等）
         .enable_all()
         // 全局队列间隔：31（默认值，平衡公平性和性能）
         .global_queue_interval(31)
         // 事件间隔：61（减少系统调用频率）
-        .event_interval(61)
+        // 降低事件间隔以提高 I/O 响应速度
+        .event_interval(31)
         .build()
         .context("创建 Tokio 运行时失败")?;
 
@@ -332,11 +338,12 @@ async fn async_main() -> Result<()> {
     // ⚡ 显示运行时配置
     let num_cpus = num_cpus::get();
     let num_physical_cpus = num_cpus::get_physical();
+    let worker_threads = std::cmp::max(4, num_cpus / 2);
     log::info!("🚀 Tokio 运行时配置:");
-    log::info!("  工作线程数: {} (CPU 核心: {} 物理, {} 逻辑)", num_cpus, num_physical_cpus, num_cpus);
-    log::info!("  线程栈大小: 2 MB");
+    log::info!("  工作线程数: {} (CPU 核心: {} 物理, {} 逻辑)", worker_threads, num_physical_cpus, num_cpus);
+    log::info!("  线程栈大小: 默认 (~1MB)");
     log::info!("  全局队列间隔: 31 (任务公平性)");
-    log::info!("  事件间隔: 61 (减少系统调用)");
+    log::info!("  事件间隔: 31 (I/O 响应优化)");
 
     let listen_addr: SocketAddr = config
         .listen_addr
