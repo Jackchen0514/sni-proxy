@@ -1,6 +1,7 @@
 // 模块声明
 pub mod dns;
 pub mod domain;
+pub mod domain_ip_tracker;
 pub mod ip_matcher;
 pub mod ip_traffic;
 pub mod logger;
@@ -13,6 +14,7 @@ pub mod tls;
 // 重新导出主要的公共类型和函数
 pub use dns::{clear_dns_cache, get_dns_cache_size, resolve_host_cached};
 pub use domain::DomainMatcher;
+pub use domain_ip_tracker::DomainIpTracker;
 pub use ip_matcher::IpMatcher;
 pub use ip_traffic::{IpTrafficTracker, IpTrafficSnapshot};
 pub use logger::{init_default_logger, init_from_env, init_logger, LogConfig, LogLevel};

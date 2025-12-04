@@ -11,6 +11,7 @@ use tokio::sync::watch;
 
 use crate::dns::resolve_host_cached;
 use crate::domain::DomainMatcher;
+use crate::domain_ip_tracker::DomainIpTracker;
 use crate::ip_matcher::IpMatcher;
 use crate::ip_traffic::IpTrafficTracker;
 use crate::metrics::{ConnectionGuard, Metrics};
@@ -36,6 +37,8 @@ pub struct SniProxy {
     metrics: Metrics,
     /// IP 流量追踪器
     ip_traffic_tracker: IpTrafficTracker,
+    /// 域名-IP 追踪器
+    domain_ip_tracker: DomainIpTracker,
 }
 
 impl SniProxy {
@@ -66,6 +69,7 @@ impl SniProxy {
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
+            domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
         }
     }
 
@@ -101,6 +105,7 @@ impl SniProxy {
             socks5_config: None,
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
+            domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
         }
     }
 
@@ -139,6 +144,15 @@ impl SniProxy {
         persistence_file: Option<String>,
     ) -> Self {
         self.ip_traffic_tracker = IpTrafficTracker::new(max_tracked_ips, output_file, persistence_file);
+        self
+    }
+
+    /// 启用域名-IP 追踪（记录所有通过的域名及其解析的 IP）
+    ///
+    /// # 参数
+    /// * `output_file` - 输出文件路径（可选）
+    pub fn with_domain_ip_tracking(mut self, output_file: Option<String>) -> Self {
+        self.domain_ip_tracker = DomainIpTracker::new(output_file);
         self
     }
 
@@ -233,19 +247,6 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
-        // ⚡ 预热：预解析热门域名的 DNS（仅用于直连模式）
-        if self.socks5_config.is_none() {
-            info!("预热 DNS 缓存...");
-            let common_domains = vec!["claude.ai", "www.netflix.com", "api.anthropic.com"];
-            for domain in common_domains {
-                if let Err(e) = resolve_host_cached(domain).await {
-                    debug!("预热 DNS 失败 {}: {}", domain, e);
-                } else {
-                    debug!("预热 DNS 成功: {}", domain);
-                }
-            }
-        }
-
         if let Some(socks5) = &self.socks5_config {
             info!("使用 SOCKS5 出口: {}", socks5.addr);
             if socks5.username.is_some() {
@@ -293,6 +294,33 @@ impl SniProxy {
             info!("✅ IP 流量追踪定期保存已启用（每 5 分钟）");
         }
 
+        // 启动后台任务：每分钟打印域名-IP 统计（仅在启用时）
+        if self.domain_ip_tracker.is_enabled() {
+            let domain_ip_tracker_clone = self.domain_ip_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    domain_ip_tracker_clone.print_summary();
+                }
+            });
+            info!("✅ 域名-IP 追踪已启用");
+
+            // 启动后台任务：每 5 分钟保存一次域名-IP 映射
+            let domain_ip_tracker_clone = self.domain_ip_tracker.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 分钟
+                loop {
+                    interval.tick().await;
+                    info!("💾 定期保存域名-IP 映射数据...");
+                    if let Err(e) = domain_ip_tracker_clone.save_to_file() {
+                        error!("保存域名-IP 映射失败: {}", e);
+                    }
+                }
+            });
+            info!("✅ 域名-IP 追踪定期保存已启用（每 5 分钟）");
+        }
+
         loop {
             use std::time::Instant;
 
@@ -329,6 +357,14 @@ impl SniProxy {
                             if self.ip_traffic_tracker.is_enabled() {
                                 info!("💾 保存 IP 流量统计数据...");
                                 self.ip_traffic_tracker.save_to_persistence_file();
+                            }
+
+                            // 保存域名-IP 映射数据
+                            if self.domain_ip_tracker.is_enabled() {
+                                info!("💾 保存域名-IP 映射数据...");
+                                if let Err(e) = self.domain_ip_tracker.save_to_file() {
+                                    error!("保存域名-IP 映射失败: {}", e);
+                                }
                             }
 
                             // 打印最终统计
@@ -428,6 +464,7 @@ async fn handle_new_connection(
     let socks5_config = proxy.socks5_config.clone();
     let metrics = proxy.metrics.clone();
     let ip_traffic_tracker = proxy.ip_traffic_tracker.clone();
+    let domain_ip_tracker = proxy.domain_ip_tracker.clone();
 
     // 使用 catch_unwind 捕获 panic
     tokio::spawn(async move {
@@ -444,6 +481,7 @@ async fn handle_new_connection(
             socks5_config,
             metrics.clone(),
             ip_traffic_tracker,
+            domain_ip_tracker,
         ))
         .catch_unwind()
         .await;
@@ -476,6 +514,7 @@ async fn handle_connection(
     socks5_config: Option<Arc<Socks5Config>>,
     metrics: Metrics,
     ip_traffic_tracker: IpTrafficTracker,
+    domain_ip_tracker: DomainIpTracker,
 ) -> Result<()> {
     use std::time::Instant;
     let start_time = Instant::now();
@@ -573,14 +612,15 @@ async fn handle_connection(
     };
 
     // 检查白名单并决定连接方式
+    // ⚡ 延迟优化：减少热路径日志，只在 debug 模式或失败时输出
     let use_socks5 = if let Some(ref socks5_matcher) = socks5_matcher {
         // 优先检查 SOCKS5 白名单
         if socks5_matcher.matches(&sni) {
-            info!("域名 {} 匹配 SOCKS5 白名单", sni);
+            debug!("域名 {} 匹配 SOCKS5 白名单", sni);
             metrics.inc_socks5_requests();
             true
         } else if direct_matcher.matches(&sni) {
-            info!("域名 {} 匹配直连白名单", sni);
+            debug!("域名 {} 匹配直连白名单", sni);
             metrics.inc_direct_requests();
             false
         } else {
@@ -592,7 +632,7 @@ async fn handle_connection(
     } else {
         // 如果没有 SOCKS5 白名单，只检查直连白名单
         if direct_matcher.matches(&sni) {
-            info!("域名 {} 匹配白名单，使用直连", sni);
+            debug!("域名 {} 匹配白名单，使用直连", sni);
             metrics.inc_direct_requests();
             false
         } else {
@@ -608,10 +648,12 @@ async fn handle_connection(
     let target_stream = if use_socks5 && socks5_config.is_some() {
         // 通过 SOCKS5 连接
         let socks5 = socks5_config.as_ref().unwrap();
-        info!("通过 SOCKS5 连接到 {}:443", sni);
+        debug!("通过 SOCKS5 连接到 {}:443", sni);
         match connect_via_socks5(&sni, 443, socks5.as_ref()).await {
             Ok(stream) => {
-                info!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
+                debug!("⏱️  SOCKS5 连接 {} 耗时: {:?}", sni, connect_start.elapsed());
+                // 记录通过 SOCKS5 的域名（无法获取实际解析的 IP）
+                domain_ip_tracker.record_socks5(&sni);
                 stream
             },
             Err(e) => {
@@ -623,7 +665,21 @@ async fn handle_connection(
         }
     } else {
         // 直接连接
-        let target_addr = format!("{}:443", sni);
+        // ⚡ 先解析 DNS，获取 IP 地址，用于域名-IP 追踪
+        let resolved_ips = match resolve_host_cached(&sni).await {
+            Ok(ips) => {
+                // 记录域名和所有解析出的 IP
+                for ip in &ips {
+                    domain_ip_tracker.record(&sni, *ip);
+                }
+                ips
+            },
+            Err(e) => {
+                error!("DNS 解析失败 {}: {}", sni, e);
+                metrics.inc_failed_connections();
+                return Ok(());
+            }
+        };
 
         // ⚡ 自适应连接超时：根据服务器规模调整
         let connect_timeout_secs = if num_cpus <= 2 {
@@ -634,18 +690,20 @@ async fn handle_connection(
             8  // 大型服务器：8秒（容忍慢网络）
         };
 
+        // 尝试连接到第一个 IP
+        let target_addr = (resolved_ips[0], 443);
         match timeout(
             Duration::from_secs(connect_timeout_secs),
-            TcpStream::connect(&target_addr)
+            TcpStream::connect(target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                error!("连接到目标服务器 {} 失败: {}", target_addr, e);
+                error!("连接到目标服务器 {}:{} 失败: {}", resolved_ips[0], 443, e);
                 metrics.inc_failed_connections();
                 return Ok(());
             }
             Err(_) => {
-                error!("连接到目标服务器 {} 超时", target_addr);
+                error!("连接到目标服务器 {}:{} 超时", resolved_ips[0], 443);
                 metrics.inc_connection_timeouts();
                 metrics.inc_failed_connections();
                 return Ok(());
@@ -657,7 +715,8 @@ async fn handle_connection(
     let mut target_stream = target_stream;
     let _ = crate::proxy::optimize_tcp_for_streaming(&target_stream);
 
-    debug!("成功连接到目标服务器 {}:443", sni);
+    // ⚡ 延迟优化：只在 debug 模式记录成功连接
+    debug!("✅ 连接到 {}:443 成功 (耗时: {:?})", sni, connect_start.elapsed());
 
     // 转发 Client Hello
     if let Err(e) = target_stream.write_all(&buffer).await {
@@ -679,7 +738,8 @@ async fn handle_connection(
         debug!("数据转发结束: {}", e);
     }
 
-    info!("⏱️  {} 总耗时: {:?} (连接: {:?}, 转发: {:?})",
+    // ⚡ 延迟优化：性能统计只在 debug 模式输出
+    debug!("⏱️  {} 总耗时: {:?} (连接: {:?}, 转发: {:?})",
           sni,
           start_time.elapsed(),
           connect_start.elapsed(),

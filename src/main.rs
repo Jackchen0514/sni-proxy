@@ -20,6 +20,8 @@ struct Config {
     ip_whitelist: Vec<String>,
     /// IP 流量追踪配置（可选）
     ip_traffic_tracking: Option<IpTrafficTrackingConfig>,
+    /// 域名-IP 追踪配置（可选）
+    domain_ip_tracking: Option<DomainIpTrackingConfig>,
     /// SOCKS5 代理配置（可选）
     socks5: Option<Socks5ConfigFile>,
     /// 日志配置（可选）
@@ -42,6 +44,15 @@ struct IpTrafficTrackingConfig {
 
 fn default_max_tracked_ips() -> usize {
     1000
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DomainIpTrackingConfig {
+    /// 是否启用域名-IP 追踪
+    #[serde(default)]
+    enabled: bool,
+    /// 输出文件路径
+    output_file: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -438,6 +449,19 @@ async fn async_main() -> Result<()> {
                 tracking_config.output_file,
                 tracking_config.persistence_file,
             );
+        }
+    }
+
+    // 配置域名-IP 追踪（如果启用）
+    if let Some(domain_ip_tracking_config) = config.domain_ip_tracking {
+        if domain_ip_tracking_config.enabled {
+            log::info!("启用域名-IP 追踪:");
+            if let Some(ref output_file) = domain_ip_tracking_config.output_file {
+                log::info!("  输出文件: {}", output_file);
+            } else {
+                log::info!("  输出文件: 未指定（不保存到文件）");
+            }
+            proxy = proxy.with_domain_ip_tracking(domain_ip_tracking_config.output_file);
         }
     }
 
