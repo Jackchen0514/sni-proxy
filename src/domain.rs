@@ -66,6 +66,22 @@ impl DomainMatcher {
 
         false
     }
+
+    /// 获取所有域名模式（用于 DNS 预热等场景）
+    /// 返回格式：精确域名 + 通配符域名（带 "*." 前缀）
+    pub fn get_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+
+        // 添加精确匹配域名
+        patterns.extend(self.exact_domains.iter().cloned());
+
+        // 添加通配符域名（恢复 "*." 前缀）
+        for wildcard_suffix in &self.wildcard_domains {
+            patterns.push(format!("*.{}", wildcard_suffix));
+        }
+
+        patterns
+    }
 }
 
 #[cfg(test)]

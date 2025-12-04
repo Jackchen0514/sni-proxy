@@ -233,49 +233,81 @@ impl SniProxy {
         info!("SNI 代理服务器启动在 {}", self.listen_addr);
         info!("最大并发连接数: {}", self.max_connections);
 
-        // ⚡ 延迟优化：预热 DNS 缓存
-        // 根据服务器规模决定预热策略
+        // ⚡ 延迟优化：智能 DNS 缓存预热
+        // 根据服务器规模和白名单决定预热策略
         let num_cpus = num_cpus::get();
-        if self.socks5_config.is_none() {
-            info!("🔥 预热 DNS 缓存...");
+        info!("🔥 预热 DNS 缓存...");
 
-            // 预热域名列表（常用流媒体和服务）
-            let warmup_domains = if num_cpus <= 2 {
-                // 小型服务器：只预热最常用的
-                vec![
-                    "www.netflix.com",
-                    "www.youtube.com",
-                    "api.openai.com",
-                ]
-            } else {
-                // 大型服务器：预热更多域名
-                vec![
-                    "www.netflix.com",
-                    "www.youtube.com",
-                    "api.openai.com",
-                    "claude.ai",
-                    "api.anthropic.com",
-                    "www.google.com",
-                    "github.com",
-                    "www.cloudflare.com",
-                ]
-            };
+        let mut warmup_domains = Vec::new();
+
+        // 1. 获取所有域名模式（直连 + SOCKS5）
+        let mut all_patterns: Vec<String> = self.direct_matcher.get_patterns();
+        if let Some(ref socks5_matcher) = self.socks5_matcher {
+            all_patterns.extend(socks5_matcher.get_patterns());
+        }
+
+        // 2. 提取具体域名（非泛域名）
+        for domain in &all_patterns {
+            if !domain.starts_with('*') && !domain.contains('*') {
+                warmup_domains.push(domain.clone());
+            }
+        }
+
+        // 3. 对泛域名生成常见子域名
+        // *.example.com → www.example.com, api.example.com
+        for pattern in &all_patterns {
+            if pattern.starts_with("*.") {
+                let base_domain = &pattern[2..]; // 去掉 "*."
+
+                // 生成常用子域名
+                let subdomains = if num_cpus <= 2 {
+                    // 小型服务器：只预热最常用的
+                    vec!["www"]
+                } else {
+                    // 大型服务器：预热更多
+                    vec!["www", "api", "cdn", "static"]
+                };
+
+                for subdomain in subdomains {
+                    warmup_domains.push(format!("{}.{}", subdomain, base_domain));
+                }
+            }
+        }
+
+        // 4. 去重并限制数量
+        warmup_domains.sort();
+        warmup_domains.dedup();
+
+        let max_warmup = if num_cpus <= 2 {
+            10  // 小型服务器：最多预热 10 个
+        } else if num_cpus <= 8 {
+            20  // 中型服务器：最多预热 20 个
+        } else {
+            30  // 大型服务器：最多预热 30 个
+        };
+
+        warmup_domains.truncate(max_warmup);
+
+        if warmup_domains.is_empty() {
+            debug!("白名单中没有具体域名，跳过 DNS 预热");
+        } else {
+            info!("准备预热 {} 个域名...", warmup_domains.len());
 
             // 并发预热所有域名
             let warmup_tasks: Vec<_> = warmup_domains
                 .into_iter()
                 .map(|domain| async move {
-                    match resolve_host_cached(domain).await {
-                        Ok(_) => debug!("✅ DNS 预热成功: {}", domain),
+                    match resolve_host_cached(&domain).await {
+                        Ok(ips) => debug!("✅ DNS 预热成功: {} → {:?}", domain, ips.first()),
                         Err(e) => debug!("⚠️  DNS 预热失败 {}: {}", domain, e),
                     }
                 })
                 .collect();
 
-            // 并行执行所有预热任务（最多等待 2 秒）
+            // 并行执行所有预热任务（最多等待 3 秒）
             let warmup_start = std::time::Instant::now();
             tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(3),
                 futures::future::join_all(warmup_tasks)
             ).await.ok();
 
