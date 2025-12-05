@@ -27,13 +27,6 @@ jobs:
             cross: false
             archive: tar.gz
 
-          # Windows x86_64
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-24.04
-            name: windows-x64
-            cross: true
-            archive: zip
-
           # Linux x86_64
           - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
@@ -57,9 +50,6 @@ jobs:
           sudo apt-get update
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
-            sudo apt-get install -y gcc-mingw-w64-x86-64
-          fi
 
       - name: Install musl-tools (Linux x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -71,9 +61,6 @@ jobs:
         run: |
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
-            export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
-          fi
           cargo build --target ${{ matrix.target }} --release
         shell: bash
 
@@ -147,7 +134,6 @@ jobs:
             - **Linux ARM64**: `*-linux-arm64.tar.gz`
             - **Linux x64**: `*-linux-x64.tar.gz`
             - **macOS ARM64**: `*-macos-arm64.tar.gz`
-            - **Windows x64**: `*-windows-x64.zip`
             
             Verify checksums using `SHA256SUMS`.
         env:
