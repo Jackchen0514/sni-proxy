@@ -45,27 +45,29 @@ impl SockmapManager {
     pub fn new(bpf: &mut Bpf) -> Result<Self> {
         info!("初始化 Sockmap 管理器（使用真正的 eBPF Maps）");
 
-        // 获取 SOCK_MAP (SockHash)
-        let sock_map: SockHash<_, u64> = SockHash::try_from(
-            bpf.map_mut("SOCK_MAP")
-                .context("无法找到 SOCK_MAP")?
-        ).context("无法创建 SockHash 对象")?;
+        // 获取 SOCK_MAP (SockHash) 并立即转换生命周期
+        let sock_map_static = {
+            let sock_map: SockHash<_, u64> = SockHash::try_from(
+                bpf.map_mut("SOCK_MAP")
+                    .context("无法找到 SOCK_MAP")?
+            ).context("无法创建 SockHash 对象")?;
 
-        // 获取 CONNECTION_MAP (HashMap)
-        let connection_map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(
-            bpf.map_mut("CONNECTION_MAP")
-                .context("无法找到 CONNECTION_MAP")?
-        ).context("无法创建 HashMap 对象")?;
+            // 立即转换生命周期，释放对 bpf 的借用
+            unsafe { std::mem::transmute(sock_map) }
+        };
+
+        // 获取 CONNECTION_MAP (HashMap) 并立即转换生命周期
+        let connection_map_static = {
+            let connection_map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(
+                bpf.map_mut("CONNECTION_MAP")
+                    .context("无法找到 CONNECTION_MAP")?
+            ).context("无法创建 HashMap 对象")?;
+
+            // 立即转换生命周期，释放对 bpf 的借用
+            unsafe { std::mem::transmute(connection_map) }
+        };
 
         info!("✓ 成功获取 eBPF Maps: SOCK_MAP, CONNECTION_MAP");
-
-        // 安全提示：这里使用 unsafe 将生命周期扩展为 'static
-        // 这是安全的，因为：
-        // 1. Bpf 对象存储在 EbpfManager::_ebpf 中
-        // 2. SockmapManager 也存储在同一个 EbpfManager 中
-        // 3. 因此 Map 的生命周期至少和 SockmapManager 一样长
-        let sock_map_static = unsafe { std::mem::transmute(sock_map) };
-        let connection_map_static = unsafe { std::mem::transmute(connection_map) };
 
         Ok(Self {
             sock_map: sock_map_static,

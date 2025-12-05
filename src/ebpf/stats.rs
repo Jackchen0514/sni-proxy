@@ -56,24 +56,29 @@ impl EbpfStats {
     pub fn new(bpf: &mut Bpf) -> Result<Self> {
         info!("初始化 eBPF 流量统计（使用真正的 eBPF Maps）");
 
-        // 获取 TRAFFIC_STATS (PerCpuArray)
-        let traffic_stats_map: PerCpuArray<_, u64> = PerCpuArray::try_from(
-            bpf.map_mut("TRAFFIC_STATS")
-                .context("无法找到 TRAFFIC_STATS")?
-        ).context("无法创建 PerCpuArray 对象")?;
+        // 获取 TRAFFIC_STATS (PerCpuArray) 并立即转换生命周期
+        let traffic_stats_map_static = {
+            let traffic_stats_map: PerCpuArray<_, u64> = PerCpuArray::try_from(
+                bpf.map_mut("TRAFFIC_STATS")
+                    .context("无法找到 TRAFFIC_STATS")?
+            ).context("无法创建 PerCpuArray 对象")?;
 
-        // 获取 CONNECTION_STATS (HashMap)
-        let connection_stats_map: AyaHashMap<_, u64, ConnectionStats> = AyaHashMap::try_from(
-            bpf.map_mut("CONNECTION_STATS")
-                .context("无法找到 CONNECTION_STATS")?
-        ).context("无法创建 HashMap 对象")?;
+            // 立即转换生命周期，释放对 bpf 的借用
+            unsafe { std::mem::transmute(traffic_stats_map) }
+        };
+
+        // 获取 CONNECTION_STATS (HashMap) 并立即转换生命周期
+        let connection_stats_map_static = {
+            let connection_stats_map: AyaHashMap<_, u64, ConnectionStats> = AyaHashMap::try_from(
+                bpf.map_mut("CONNECTION_STATS")
+                    .context("无法找到 CONNECTION_STATS")?
+            ).context("无法创建 HashMap 对象")?;
+
+            // 立即转换生命周期，释放对 bpf 的借用
+            unsafe { std::mem::transmute(connection_stats_map) }
+        };
 
         info!("✓ 成功获取 eBPF Maps: TRAFFIC_STATS, CONNECTION_STATS");
-
-        // 安全提示：使用 unsafe 将生命周期扩展为 'static
-        // 原因同其他 Map 管理器，生命周期由 EbpfManager 保证
-        let traffic_stats_map_static = unsafe { std::mem::transmute(traffic_stats_map) };
-        let connection_stats_map_static = unsafe { std::mem::transmute(connection_stats_map) };
 
         Ok(Self {
             traffic_stats_map: traffic_stats_map_static,

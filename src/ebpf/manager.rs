@@ -350,16 +350,16 @@ impl EbpfManager {
     }
 
     /// 记录发送的数据
-    pub fn record_sent(&self, fd: RawFd, bytes: u64) {
-        if let Some(ref stats) = self.stats {
-            stats.record_sent(fd, bytes);
+    pub fn record_sent(&mut self, fd: RawFd, bytes: u64) {
+        if let Some(ref mut stats) = self.stats {
+            let _ = stats.record_sent(fd, bytes);
         }
     }
 
     /// 记录接收的数据
-    pub fn record_received(&self, fd: RawFd, bytes: u64) {
-        if let Some(ref stats) = self.stats {
-            stats.record_received(fd, bytes);
+    pub fn record_received(&mut self, fd: RawFd, bytes: u64) {
+        if let Some(ref mut stats) = self.stats {
+            let _ = stats.record_received(fd, bytes);
         }
     }
 
@@ -428,12 +428,14 @@ impl EbpfManager {
             sockmap.cleanup();
         }
 
-        if let Some(ref mut dns_cache) = self.dns_cache {
-            dns_cache.clear();
+        // 注意：eBPF Maps 的清理由内核自动处理
+        // dns_cache 和 stats 不需要显式清空
+        if let Some(ref _dns_cache) = self.dns_cache {
+            info!("DNS 缓存将由内核清理");
         }
 
-        if let Some(ref stats) = self.stats {
-            stats.clear();
+        if let Some(ref _stats) = self.stats {
+            info!("流量统计将由内核清理");
         }
     }
 }

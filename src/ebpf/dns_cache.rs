@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use aya::maps::HashMap as AyaHashMap;  // 暂时使用 HashMap 替代 LruHashMap
 use aya::Bpf;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
