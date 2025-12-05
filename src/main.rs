@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sni_proxy::logger::{init_logger, LogConfig, LogLevel};
-use sni_proxy::{SniProxy, Socks5Config};
+use sni_proxy::{SniProxy, Socks5Config, EbpfConfig};
 use std::fs;
 use std::net::SocketAddr;
 
@@ -26,6 +26,9 @@ struct Config {
     socks5: Option<Socks5ConfigFile>,
     /// 日志配置（可选）
     log: Option<LogConfigFile>,
+    /// eBPF 配置（可选）
+    #[serde(default)]
+    ebpf: Option<EbpfConfigFile>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -113,6 +116,65 @@ fn default_max_backups() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct EbpfConfigFile {
+    /// 是否启用 eBPF 加速
+    #[serde(default)]
+    enabled: bool,
+    /// Sockmap 配置（可选）
+    sockmap: Option<EbpfSockmapConfigFile>,
+    /// DNS 缓存配置（可选）
+    dns_cache: Option<EbpfDnsCacheConfigFile>,
+    /// 流量统计配置（可选）
+    stats: Option<EbpfStatsConfigFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct EbpfSockmapConfigFile {
+    /// 是否启用 Sockmap
+    #[serde(default)]
+    enabled: bool,
+    /// 最大条目数
+    #[serde(default = "default_sockmap_max_entries")]
+    max_entries: usize,
+}
+
+fn default_sockmap_max_entries() -> usize {
+    65536
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct EbpfDnsCacheConfigFile {
+    /// 是否启用 DNS 缓存
+    #[serde(default)]
+    enabled: bool,
+    /// 最大条目数
+    #[serde(default = "default_dns_cache_max_entries")]
+    max_entries: usize,
+}
+
+fn default_dns_cache_max_entries() -> usize {
+    10000
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct EbpfStatsConfigFile {
+    /// 是否启用流量统计
+    #[serde(default)]
+    enabled: bool,
+}
+
+impl Default for EbpfConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sockmap: None,
+            dns_cache: None,
+            stats: None,
+        }
+    }
 }
 
 impl Default for LogConfigFile {
@@ -414,6 +476,25 @@ async fn async_main() -> Result<()> {
         log::info!("未配置 IP 白名单，允许所有 IP 访问");
     }
 
+    // 转换 eBPF 配置
+    let ebpf_config = if let Some(ref ebpf_cfg) = config.ebpf {
+        if ebpf_cfg.enabled {
+            log::info!("配置 eBPF 加速");
+            Some(EbpfConfig {
+                enabled: true,
+                sockmap_enabled: ebpf_cfg.sockmap.as_ref().map(|s| s.enabled).unwrap_or(false),
+                dns_cache_enabled: ebpf_cfg.dns_cache.as_ref().map(|d| d.enabled).unwrap_or(false),
+                dns_cache_size: ebpf_cfg.dns_cache.as_ref().map(|d| d.max_entries).unwrap_or(10000),
+                stats_enabled: ebpf_cfg.stats.as_ref().map(|s| s.enabled).unwrap_or(false),
+            })
+        } else {
+            log::info!("eBPF 配置存在但未启用");
+            None
+        }
+    } else {
+        None
+    };
+
     // 创建代理实例
     let has_socks5_whitelist = !config.socks5_whitelist.is_empty();
     let mut proxy = if has_socks5_whitelist {
@@ -422,10 +503,11 @@ async fn async_main() -> Result<()> {
             listen_addr,
             config.whitelist,
             config.socks5_whitelist,
+            ebpf_config.clone(),
         )
     } else {
         // 使用单一白名单模式（仅直连）
-        SniProxy::new(listen_addr, config.whitelist)
+        SniProxy::new(listen_addr, config.whitelist, ebpf_config.clone())
     };
 
     // 配置 IP 白名单（如果提供）
