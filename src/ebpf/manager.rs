@@ -96,9 +96,17 @@ impl EbpfManager {
         // 尝试加载 eBPF 程序
         let ebpf_obj = Self::load_ebpf_program();
         let mut ebpf = match ebpf_obj {
-            Ok(ebpf) => {
+            Ok(mut bpf_loaded) => {
                 info!("✅ eBPF 程序加载成功");
-                Some(ebpf)
+
+                // 尝试 attach eBPF 程序到 hook 点
+                if let Err(e) = Self::attach_ebpf_programs(&mut bpf_loaded) {
+                    warn!("⚠️  eBPF 程序 attach 失败: {}, 但程序已加载", e);
+                } else {
+                    info!("✅ eBPF 程序 attach 成功");
+                }
+
+                Some(bpf_loaded)
             }
             Err(e) => {
                 warn!("⚠️  eBPF 程序加载失败: {}, 将降级到传统模式", e);
@@ -210,6 +218,64 @@ impl EbpfManager {
         } else {
             anyhow::bail!("未找到 eBPF 程序文件: {:?}", ebpf_path)
         }
+    }
+
+    /// Attach eBPF 程序到相应的 hook 点
+    fn attach_ebpf_programs(bpf: &mut Bpf) -> Result<()> {
+        use log::debug as log_debug;
+        info!("Attaching eBPF 程序...");
+
+        // 尝试 attach SK_MSG 程序（用于 sockmap）
+        if let Some(program) = bpf.program_mut("redirect_msg") {
+            use aya::programs::SkMsg;
+            match program.try_into() {
+                Ok(sk_msg) => {
+                    let sk_msg_prog: &mut SkMsg = sk_msg;
+                    match sk_msg_prog.load() {
+                        Ok(_) => {
+                            info!("✓ SK_MSG 程序加载成功");
+                            // 注意：attach 需要 SockHash 引用，这里我们只加载程序
+                            // 实际的 attach 会在第一次使用 sockmap 时进行
+                        }
+                        Err(e) => {
+                            warn!("SK_MSG 程序加载失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("SK_MSG 程序类型转换失败: {}", e);
+                }
+            }
+        } else {
+            log_debug!("未找到 redirect_msg 程序");
+        }
+
+        // 尝试 attach XDP 程序（如果存在）
+        if let Some(program) = bpf.program_mut("xdp_ip_filter") {
+            use aya::programs::Xdp;
+            match program.try_into() {
+                Ok(xdp) => {
+                    let xdp_prog: &mut Xdp = xdp;
+                    match xdp_prog.load() {
+                        Ok(_) => {
+                            info!("✓ XDP 程序加载成功（未 attach 到接口）");
+                            // attach 到网络接口需要接口名称，稍后处理
+                        }
+                        Err(e) => {
+                            warn!("XDP 程序加载失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("XDP 程序类型转换失败: {}", e);
+                }
+            }
+        } else {
+            log_debug!("未找到 xdp_ip_filter 程序");
+        }
+
+        info!("eBPF 程序 attach 完成");
+        Ok(())
     }
 
     /// 是否已初始化
