@@ -10,12 +10,14 @@
 /// - 延迟: -30-80%
 /// - CPU 使用: -40-60%
 
+pub mod types;
 pub mod sockmap;
 pub mod dns_cache;
 pub mod stats;
 pub mod xdp;
 pub mod manager;
 
+pub use types::{DnsRecord, ConnectionStats};
 pub use sockmap::SockmapManager;
 pub use dns_cache::EbpfDnsCache;
 pub use stats::EbpfStats;
