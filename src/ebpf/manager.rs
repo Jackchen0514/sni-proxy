@@ -11,6 +11,7 @@
 
 use super::{EbpfCapabilities, EbpfDnsCache, SockmapManager, EbpfStats};
 use anyhow::{Context, Result};
+use aya::Bpf;
 use log::{error, info, warn};
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
@@ -45,6 +46,8 @@ pub struct EbpfManager {
     dns_cache: Option<EbpfDnsCache>,
     stats: Option<EbpfStats>,
     initialized: bool,
+    // 保持对 eBPF 对象的引用，防止被drop
+    _ebpf: Option<Bpf>,
 }
 
 impl EbpfManager {
@@ -68,6 +71,7 @@ impl EbpfManager {
                 dns_cache: None,
                 stats: None,
                 initialized: false,
+                _ebpf: None,
             });
         }
 
@@ -85,8 +89,30 @@ impl EbpfManager {
                 dns_cache: None,
                 stats: None,
                 initialized: false,
+                _ebpf: None,
             });
         }
+
+        // 尝试加载 eBPF 程序
+        let ebpf_obj = Self::load_ebpf_program();
+        let mut ebpf = match ebpf_obj {
+            Ok(ebpf) => {
+                info!("✅ eBPF 程序加载成功");
+                Some(ebpf)
+            }
+            Err(e) => {
+                warn!("⚠️  eBPF 程序加载失败: {}, 将降级到传统模式", e);
+                return Ok(Self {
+                    config,
+                    capabilities,
+                    sockmap: None,
+                    dns_cache: None,
+                    stats: None,
+                    initialized: false,
+                    _ebpf: None,
+                });
+            }
+        };
 
         // 初始化各个组件
         let sockmap = if config.sockmap_enabled {
@@ -141,7 +167,49 @@ impl EbpfManager {
             dns_cache,
             stats,
             initialized,
+            _ebpf: ebpf,
         })
+    }
+
+    /// 加载 eBPF 程序
+    fn load_ebpf_program() -> Result<Bpf> {
+        info!("加载 eBPF 程序...");
+
+        // 尝试嵌入的 eBPF 程序
+        #[cfg(target_os = "linux")]
+        {
+            // 从编译时嵌入的字节码加载
+            const EBPF_BYTES: &[u8] = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/bpfel-unknown-none/release/sni-proxy"
+            ));
+
+            if EBPF_BYTES.len() > 100 {
+                match Bpf::load(EBPF_BYTES) {
+                    Ok(ebpf) => {
+                        info!("✓ 从嵌入字节码加载 eBPF 程序成功");
+                        return Ok(ebpf);
+                    }
+                    Err(e) => {
+                        warn!("从嵌入字节码加载失败: {}", e);
+                    }
+                }
+            }
+        }
+
+        // 如果嵌入失败，尝试从文件系统加载
+        let ebpf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/bpfel-unknown-none/release/sni-proxy");
+
+        if ebpf_path.exists() {
+            let bytes = std::fs::read(&ebpf_path)
+                .context("读取 eBPF 程序文件失败")?;
+
+            Bpf::load(&bytes)
+                .context("从文件加载 eBPF 程序失败")
+        } else {
+            anyhow::bail!("未找到 eBPF 程序文件: {:?}", ebpf_path)
+        }
     }
 
     /// 是否已初始化
