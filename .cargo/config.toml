@@ -1,0 +1,19 @@
+[build]
+target-dir = "target"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+rustflags = [
+    "-C", "link-arg=--disable-memory-builtins",
+    "-C", "linker-plugin-lto",
+]
+
+[target.bpfeb-unknown-none]
+linker = "bpf-linker"
+rustflags = [
+    "-C", "link-arg=--disable-memory-builtins",
+    "-C", "linker-plugin-lto",
+]
