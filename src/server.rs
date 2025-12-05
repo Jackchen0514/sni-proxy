@@ -18,6 +18,7 @@ use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy::proxy_data;
 use crate::socks5::{connect_via_socks5, Socks5Config};
 use crate::tls::parse_sni;
+use crate::ebpf::{EbpfManager, EbpfConfig};
 
 /// SNI 代理服务器
 pub struct SniProxy {
@@ -39,11 +40,13 @@ pub struct SniProxy {
     ip_traffic_tracker: IpTrafficTracker,
     /// 域名-IP 追踪器
     domain_ip_tracker: DomainIpTracker,
+    /// eBPF 管理器（可选）
+    ebpf_manager: Option<Arc<tokio::sync::Mutex<EbpfManager>>>,
 }
 
 impl SniProxy {
     /// 创建新的 SNI 代理实例（仅直连白名单）
-    pub fn new(listen_addr: SocketAddr, direct_whitelist: Vec<String>) -> Self {
+    pub fn new(listen_addr: SocketAddr, direct_whitelist: Vec<String>, ebpf_config: Option<EbpfConfig>) -> Self {
         let direct_matcher = DomainMatcher::new(direct_whitelist);
 
         // 🚀 自适应最大连接数：根据 CPU 核心数动态调整
@@ -60,6 +63,22 @@ impl SniProxy {
             std::cmp::min(10000, num_cpus * 500)
         };
 
+        // 初始化 eBPF 管理器
+        let ebpf_manager = if let Some(cfg) = ebpf_config {
+            match EbpfManager::new(cfg) {
+                Ok(manager) => {
+                    info!("✅ eBPF 管理器初始化成功");
+                    Some(Arc::new(tokio::sync::Mutex::new(manager)))
+                }
+                Err(e) => {
+                    warn!("⚠️  eBPF 管理器初始化失败: {}, 使用传统模式", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
@@ -70,6 +89,7 @@ impl SniProxy {
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
             domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
+            ebpf_manager,
         }
     }
 
@@ -78,6 +98,7 @@ impl SniProxy {
         listen_addr: SocketAddr,
         direct_whitelist: Vec<String>,
         socks5_whitelist: Vec<String>,
+        ebpf_config: Option<EbpfConfig>,
     ) -> Self {
         let direct_matcher = DomainMatcher::new(direct_whitelist);
         let socks5_matcher = if socks5_whitelist.is_empty() {
@@ -96,6 +117,22 @@ impl SniProxy {
             std::cmp::min(10000, num_cpus * 500)
         };
 
+        // 初始化 eBPF 管理器
+        let ebpf_manager = if let Some(cfg) = ebpf_config {
+            match EbpfManager::new(cfg) {
+                Ok(manager) => {
+                    info!("✅ eBPF 管理器初始化成功");
+                    Some(Arc::new(tokio::sync::Mutex::new(manager)))
+                }
+                Err(e) => {
+                    warn!("⚠️  eBPF 管理器初始化失败: {}, 使用传统模式", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             listen_addr,
             direct_matcher: Arc::new(direct_matcher),
@@ -106,6 +143,7 @@ impl SniProxy {
             metrics: Metrics::new(),
             ip_traffic_tracker: IpTrafficTracker::disabled(), // 默认禁用
             domain_ip_tracker: DomainIpTracker::disabled(), // 默认禁用
+            ebpf_manager,
         }
     }
 
@@ -385,6 +423,7 @@ impl SniProxy {
                                     &semaphore,
                                     &self,
                                     Instant::now(),
+                                    self.ebpf_manager.clone(),
                                 ).await;
                                 false
                             }
@@ -406,6 +445,7 @@ impl SniProxy {
                             &semaphore,
                             &self,
                             Instant::now(),
+                            self.ebpf_manager.clone(),
                         ).await;
                         false
                     }
@@ -433,6 +473,7 @@ async fn handle_new_connection(
     semaphore: &Arc<tokio::sync::Semaphore>,
     proxy: &SniProxy,
     accept_start: std::time::Instant,
+    ebpf_manager: Option<Arc<tokio::sync::Mutex<EbpfManager>>>,
 ) {
     let accept_elapsed = accept_start.elapsed();
 
@@ -465,6 +506,7 @@ async fn handle_new_connection(
     let metrics = proxy.metrics.clone();
     let ip_traffic_tracker = proxy.ip_traffic_tracker.clone();
     let domain_ip_tracker = proxy.domain_ip_tracker.clone();
+    let ebpf_manager_clone = ebpf_manager.clone();
 
     // 使用 catch_unwind 捕获 panic
     tokio::spawn(async move {
@@ -482,6 +524,7 @@ async fn handle_new_connection(
             metrics.clone(),
             ip_traffic_tracker,
             domain_ip_tracker,
+            ebpf_manager_clone,
         ))
         .catch_unwind()
         .await;
@@ -505,6 +548,7 @@ async fn handle_new_connection(
 /// ⚡ 优化版本: 更快的超时和更大的缓冲区
 /// 支持分流: 直连白名单和 SOCKS5 白名单
 /// 支持 IP 白名单: 只有在白名单中的 IP 才允许连接
+/// 支持 eBPF 加速: DNS 缓存、Sockmap 等
 async fn handle_connection(
     mut client_stream: TcpStream,
     client_addr: SocketAddr,
@@ -515,6 +559,7 @@ async fn handle_connection(
     metrics: Metrics,
     ip_traffic_tracker: IpTrafficTracker,
     domain_ip_tracker: DomainIpTracker,
+    ebpf_manager: Option<Arc<tokio::sync::Mutex<EbpfManager>>>,
 ) -> Result<()> {
     use std::time::Instant;
     let start_time = Instant::now();
@@ -665,19 +710,54 @@ async fn handle_connection(
         }
     } else {
         // 直接连接
-        // ⚡ 先解析 DNS，获取 IP 地址，用于域名-IP 追踪
-        let resolved_ips = match resolve_host_cached(&sni).await {
-            Ok(ips) => {
-                // 记录域名和所有解析出的 IP
-                for ip in &ips {
-                    domain_ip_tracker.record(&sni, *ip);
+        // ⚡ 先尝试 eBPF DNS 缓存，然后解析 DNS，获取 IP 地址
+        let resolved_ips = if let Some(ref manager) = ebpf_manager {
+            let mut mgr = manager.lock().await;
+            if let Some(cached_ip) = mgr.lookup_dns(&sni) {
+                debug!("🚀 eBPF DNS 缓存命中: {} -> {}", sni, cached_ip);
+                vec![cached_ip]
+            } else {
+                debug!("eBPF DNS 缓存未命中: {}, 执行 DNS 查询", sni);
+                drop(mgr); // 释放锁
+                match resolve_host_cached(&sni).await {
+                    Ok(ips) => {
+                        // 记录域名和所有解析出的 IP
+                        for ip in &ips {
+                            domain_ip_tracker.record(&sni, *ip);
+                        }
+                        // 将第一个 IP 存入 eBPF DNS 缓存
+                        if !ips.is_empty() {
+                            if let Some(ref manager) = ebpf_manager {
+                                let mut mgr = manager.lock().await;
+                                if let Err(e) = mgr.insert_dns(&sni, ips[0]) {
+                                    debug!("插入 eBPF DNS 缓存失败: {}", e);
+                                }
+                            }
+                        }
+                        ips
+                    },
+                    Err(e) => {
+                        error!("DNS 解析失败 {}: {}", sni, e);
+                        metrics.inc_failed_connections();
+                        return Ok(());
+                    }
                 }
-                ips
-            },
-            Err(e) => {
-                error!("DNS 解析失败 {}: {}", sni, e);
-                metrics.inc_failed_connections();
-                return Ok(());
+            }
+        } else {
+            // 没有 eBPF 管理器，使用传统 DNS 解析
+            match resolve_host_cached(&sni).await {
+                Ok(ips) => {
+                    // 记录域名和所有解析出的 IP
+                    for ip in &ips {
+                        domain_ip_tracker.record(&sni, *ip);
+                    }
+                    ips
+                },
+                Err(e) => {
+                    error!("DNS 解析失败 {}: {}", sni, e);
+                    metrics.inc_failed_connections();
+                    return Ok(());
+                }
             }
         };
 
