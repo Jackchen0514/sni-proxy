@@ -1,0 +1,26 @@
+{
+  "listen_addr": "0.0.0.0:8443",
+  "whitelist": [
+    "www.google.com",
+    "github.com",
+    "*.github.io",
+    "*.anthropic.com",
+    "claude.ai"
+  ],
+  "ip_whitelist": [
+    "0.0.0.0/0",
+    "::/0"
+  ],
+  "log": {
+    "level": "info",
+    "output": "both",
+    "file_path": "/app/logs/sni-proxy.log",
+    "enable_rotation": true,
+    "max_size_mb": 100,
+    "max_backups": 5,
+    "show_timestamp": true,
+    "show_module": true,
+    "use_color": false
+  },
+  "socks5": null
+}

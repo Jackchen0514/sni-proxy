@@ -20,9 +20,9 @@ debug/
 *.sh
 
 # 本地配置
-config.json
 config-*.json
 !config.example.json
+!config.docker.json
 
 # 日志
 logs/

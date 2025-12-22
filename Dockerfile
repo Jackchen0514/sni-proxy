@@ -42,10 +42,11 @@ WORKDIR /app
 # 从构建阶段复制可执行文件
 COPY --from=builder /app/target/release/sni-proxy /app/sni-proxy
 
-# 复制示例配置文件
+# 复制配置文件
 COPY config.example.json /app/config.example.json
+COPY config.docker.json /app/config.json
 
-# 创建日志目录
+# 创建日志目录并设置权限
 RUN mkdir -p /app/logs && chown -R sniproxy:sniproxy /app
 
 # 切换到非 root 用户
