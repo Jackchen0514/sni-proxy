@@ -6,6 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+/// SOCKS5 握手各阶段统一 I/O 超时
+const SOCKS5_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// SOCKS5 代理配置
 #[derive(Debug, Clone)]
 pub struct Socks5Config {
@@ -37,7 +40,7 @@ pub async fn connect_via_socks5(
 
     // ============ 步骤 1: 连接到 SOCKS5 服务器 ============
     let mut socks5_stream = match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         TcpStream::connect(&socks5_config.addr)
     ).await {
         Ok(Ok(stream)) => stream,
@@ -97,7 +100,7 @@ pub async fn connect_via_socks5(
 
     // 发送握手请求
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.write_all(&request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 握手请求"),
@@ -108,7 +111,7 @@ pub async fn connect_via_socks5(
     // ============ 步骤 4: 读取握手响应 ============
     let mut response = [0u8; 2];
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.read_exact(&mut response)
     ).await {
         Ok(Ok(n)) => {
@@ -138,7 +141,7 @@ pub async fn connect_via_socks5(
 
             // 发送认证请求
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.write_all(&auth_request)
             ).await {
                 Ok(Ok(())) => debug!("已发送认证请求"),
@@ -149,7 +152,7 @@ pub async fn connect_via_socks5(
             // 读取认证响应
             let mut auth_response = [0u8; 2];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut auth_response)
             ).await {
                 Ok(Ok(_)) => {},
@@ -200,7 +203,7 @@ pub async fn connect_via_socks5(
 
     // 发送连接请求
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.write_all(&connect_request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 连接请求"),
@@ -211,7 +214,7 @@ pub async fn connect_via_socks5(
     // ============ 步骤 7: 读取连接响应 ============
     let mut response = [0u8; 4];
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.read_exact(&mut response)
     ).await {
         Ok(Ok(_)) => {},
@@ -244,7 +247,7 @@ pub async fn connect_via_socks5(
             // IPv4: 需要读 4 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 6];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
                 Ok(Ok(_)) => {},
@@ -260,7 +263,7 @@ pub async fn connect_via_socks5(
             // IPv6: 需要读 16 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 18];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
                 Ok(Ok(_)) => {},
@@ -275,7 +278,7 @@ pub async fn connect_via_socks5(
             // 域名: 需要读 1 个字节长度 + N 个字节域名 + 2 个字节端口
             let mut len_buf = [0u8; 1];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut len_buf)
             ).await {
                 Ok(Ok(_)) => {},
@@ -286,7 +289,7 @@ pub async fn connect_via_socks5(
             let domain_len = len_buf[0] as usize;
             let mut domain_data = vec![0u8; domain_len + 2];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut domain_data)
             ).await {
                 Ok(Ok(_)) => {},

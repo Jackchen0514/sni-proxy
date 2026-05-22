@@ -9,51 +9,48 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// IP 流量统计
-#[derive(Debug, Clone)]
-pub struct IpTrafficStats {
-    /// 接收字节数（上传）
-    bytes_received: Arc<AtomicU64>,
-    /// 发送字节数（下载）
-    bytes_sent: Arc<AtomicU64>,
-    /// 连接次数
-    connections: Arc<AtomicU64>,
+/// IP 流量统计（内部类型，通过 Mutex 访问，无需 Arc 包装各字段）
+#[derive(Debug)]
+struct IpTrafficStats {
+    bytes_received: AtomicU64,
+    bytes_sent: AtomicU64,
+    connections: AtomicU64,
 }
 
 impl IpTrafficStats {
     fn new() -> Self {
         Self {
-            bytes_received: Arc::new(AtomicU64::new(0)),
-            bytes_sent: Arc::new(AtomicU64::new(0)),
-            connections: Arc::new(AtomicU64::new(0)),
+            bytes_received: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            connections: AtomicU64::new(0),
         }
     }
 
-    pub fn add_received(&self, bytes: u64) {
+    fn add_received(&self, bytes: u64) {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn add_sent(&self, bytes: u64) {
+    fn add_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn inc_connections(&self) {
+    fn inc_connections(&self) {
         self.connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn get_received(&self) -> u64 {
+    fn get_received(&self) -> u64 {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
-    pub fn get_sent(&self) -> u64 {
+    fn get_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
     }
 
-    pub fn get_total(&self) -> u64 {
+    fn get_total(&self) -> u64 {
         self.get_received() + self.get_sent()
     }
 
-    pub fn get_connections(&self) -> u64 {
+    fn get_connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
     }
 }
@@ -82,7 +79,8 @@ impl IpTrafficTracker {
     /// * `output_file` - 统计数据输出文件路径（可选，每次覆盖写入最新数据）
     /// * `persistence_file` - 持久化数据文件路径（可选，用于服务重启后恢复数据）
     pub fn new(max_tracked_ips: usize, output_file: Option<String>, persistence_file: Option<String>) -> Self {
-        let capacity = NonZeroUsize::new(max_tracked_ips).unwrap();
+        // max(1) 防止 max_tracked_ips=0 时 unwrap panic（config 层已校验，此为防御性兜底）
+        let capacity = NonZeroUsize::new(max_tracked_ips.max(1)).unwrap();
 
         let mut tracker = Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
@@ -122,15 +120,9 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        let stats = inner
-            .stats
-            .get_or_insert(ip, || IpTrafficStats::new())
-            .clone();
-        drop(inner); // 尽早释放锁
-
-        stats.inc_connections();
+        self.inner.lock().unwrap()
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .inc_connections();
         debug!("IP {} 连接计数 +1", ip);
     }
 
@@ -139,11 +131,9 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        let stats = inner.stats.get_or_insert(ip, IpTrafficStats::new).clone();
-        drop(inner);
-        stats.add_received(bytes);
+        self.inner.lock().unwrap()
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .add_received(bytes);
     }
 
     /// 记录发送流量（下载）
@@ -151,11 +141,9 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        let stats = inner.stats.get_or_insert(ip, IpTrafficStats::new).clone();
-        drop(inner);
-        stats.add_sent(bytes);
+        self.inner.lock().unwrap()
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .add_sent(bytes);
     }
 
     /// 获取某个 IP 的统计信息
@@ -362,9 +350,9 @@ impl IpTrafficTracker {
         for (ip_str, persisted_stats) in data.stats {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 let stats = IpTrafficStats {
-                    bytes_received: Arc::new(AtomicU64::new(persisted_stats.bytes_received)),
-                    bytes_sent: Arc::new(AtomicU64::new(persisted_stats.bytes_sent)),
-                    connections: Arc::new(AtomicU64::new(persisted_stats.connections)),
+                    bytes_received: AtomicU64::new(persisted_stats.bytes_received),
+                    bytes_sent: AtomicU64::new(persisted_stats.bytes_sent),
+                    connections: AtomicU64::new(persisted_stats.connections),
                 };
                 inner.stats.put(ip, stats);
                 loaded_count += 1;

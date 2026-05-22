@@ -154,13 +154,36 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
     let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
     pos += 2;
 
-    // 验证长度并提取域名
-    if pos + name_len > data.len() || name_len == 0 || name_len > 255 {
+    // 验证长度（DNS 主机名最长 253 字符，RFC 1035）
+    if pos + name_len > data.len() || name_len == 0 || name_len > 253 {
         return None;
     }
 
-    // 提取域名并验证 UTF-8
-    String::from_utf8(data[pos..pos + name_len].to_vec()).ok()
+    // 提取域名并验证格式
+    let name = String::from_utf8(data[pos..pos + name_len].to_vec()).ok()?;
+    if !is_valid_sni_hostname(&name) {
+        return None;
+    }
+    Some(name)
+}
+
+/// 验证 SNI 主机名格式（RFC 1123）
+/// - 每个 label 1–63 字符，只含字母/数字/连字符
+/// - label 不以连字符开头或结尾
+/// - 总长度 ≤ 253（不含根域名点）
+fn is_valid_sni_hostname(name: &str) -> bool {
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -169,10 +192,28 @@ mod tests {
 
     #[test]
     fn test_parse_sni() {
-        // 这是一个简化的测试，实际的 TLS Client Hello 会更复杂
-        // 在实际使用中，你需要用真实的 TLS 握手数据来测试
-        let data = vec![0x16, 0x03, 0x01]; // TLS 握手开始
-        let result = parse_sni(&data);
-        assert!(result.is_none());
+        let data = vec![0x16, 0x03, 0x01]; // 截断的 TLS 握手
+        assert!(parse_sni(&data).is_none());
+    }
+
+    #[test]
+    fn test_valid_sni_hostnames() {
+        assert!(is_valid_sni_hostname("example.com"));
+        assert!(is_valid_sni_hostname("www.example.com"));
+        assert!(is_valid_sni_hostname("api.v2.example.com"));
+        assert!(is_valid_sni_hostname("xn--nxasmq6b.com")); // punycode
+        assert!(is_valid_sni_hostname("a"));
+        assert!(is_valid_sni_hostname("my-host.example.com"));
+    }
+
+    #[test]
+    fn test_invalid_sni_hostnames() {
+        assert!(!is_valid_sni_hostname(""));              // 空
+        assert!(!is_valid_sni_hostname("-example.com"));  // label 以 - 开头
+        assert!(!is_valid_sni_hostname("example-.com"));  // label 以 - 结尾
+        assert!(!is_valid_sni_hostname("exam ple.com"));  // 含空格
+        assert!(!is_valid_sni_hostname("example..com"));  // 空 label
+        assert!(!is_valid_sni_hostname("example.com."));  // 末尾点（空 label）
+        assert!(!is_valid_sni_hostname("exam_ple.com"));  // 含下划线
     }
 }

@@ -527,9 +527,8 @@ async fn handle_connection(
     // 检查 IP 白名单（如果配置了）
     let ip_in_whitelist = if let Some(ref ip_matcher) = ip_matcher {
         if !ip_matcher.matches(client_ip) {
-            let rejected = metrics.get_rejected_requests() + 1;
-            warn!("❌ IP {} 不在白名单中，拒绝连接 | 累计拒绝: {}", client_ip, rejected);
             metrics.inc_rejected_requests();
+            debug!("IP {} 不在白名单中，拒绝连接", client_ip);
             return Ok(());
         }
         debug!("✅ IP {} 通过白名单检查 (来自 {})", client_ip, client_addr);
@@ -624,9 +623,8 @@ async fn handle_connection(
             metrics.inc_direct_requests();
             false
         } else {
-            let rejected = metrics.get_rejected_requests() + 1;
-            warn!("❌ 域名 {} 不在任何白名单中，拒绝连接 | 累计拒绝: {}", sni, rejected);
             metrics.inc_rejected_requests();
+            debug!("域名 {} 不在任何白名单中，拒绝连接", sni);
             return Ok(());
         }
     } else {
@@ -636,9 +634,8 @@ async fn handle_connection(
             metrics.inc_direct_requests();
             false
         } else {
-            let rejected = metrics.get_rejected_requests() + 1;
-            warn!("❌ 域名 {} 不在白名单中，拒绝连接 | 累计拒绝: {}", sni, rejected);
             metrics.inc_rejected_requests();
+            debug!("域名 {} 不在白名单中，拒绝连接", sni);
             return Ok(());
         }
     };

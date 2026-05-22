@@ -61,5 +61,5 @@ ENV RUST_LOG=info
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD bash -c '</dev/tcp/localhost/8443' 2>/dev/null || exit 1
 
-# 启动命令 - 如果存在 config.json 则使用它，否则使用示例配置
-CMD ["/app/sni-proxy", "config.json"]
+# 启动命令 - 如果存在 config.json 则使用它，否则回退到示例配置
+CMD ["sh", "-c", "if [ -f /app/config.json ]; then exec /app/sni-proxy /app/config.json; else exec /app/sni-proxy /app/config.example.json; fi"]
