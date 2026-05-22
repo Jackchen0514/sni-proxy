@@ -18,8 +18,6 @@ pub struct IpMatcher {
 struct Ipv4Network {
     network: u32,
     mask: u32,
-    #[allow(dead_code)]
-    prefix_len: u8,
 }
 
 /// IPv6 网段
@@ -27,8 +25,6 @@ struct Ipv4Network {
 struct Ipv6Network {
     network: u128,
     mask: u128,
-    #[allow(dead_code)]
-    prefix_len: u8,
 }
 
 impl IpMatcher {
@@ -113,11 +109,7 @@ impl IpMatcher {
             };
             let network = ip_u32 & mask;
 
-            ipv4_networks.push(Ipv4Network {
-                network,
-                mask,
-                prefix_len,
-            });
+            ipv4_networks.push(Ipv4Network { network, mask });
 
             let network_addr = Ipv4Addr::from(network);
             info!("添加 IPv4 网段白名单: {}/{} (网络地址: {})", ip_str, prefix_len, network_addr);
@@ -137,11 +129,7 @@ impl IpMatcher {
             };
             let network = ip_u128 & mask;
 
-            ipv6_networks.push(Ipv6Network {
-                network,
-                mask,
-                prefix_len,
-            });
+            ipv6_networks.push(Ipv6Network { network, mask });
 
             let network_addr = Ipv6Addr::from(network);
             info!("添加 IPv6 网段白名单: {}/{} (网络地址: {})", ip_str, prefix_len, network_addr);

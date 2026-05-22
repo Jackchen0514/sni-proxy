@@ -72,9 +72,6 @@ pub struct IpTrafficTracker {
 struct IpTrafficTrackerInner {
     /// IP 流量统计表（使用 LRU 缓存限制内存）
     stats: LruCache<IpAddr, IpTrafficStats>,
-    /// 最大跟踪 IP 数量
-    #[allow(dead_code)]
-    max_tracked_ips: usize,
 }
 
 impl IpTrafficTracker {
@@ -90,7 +87,6 @@ impl IpTrafficTracker {
         let mut tracker = Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
                 stats: LruCache::new(capacity),
-                max_tracked_ips,
             })),
             enabled: true,
             output_file,
@@ -114,7 +110,6 @@ impl IpTrafficTracker {
         Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
                 stats: LruCache::new(NonZeroUsize::new(1).unwrap()),
-                max_tracked_ips: 0,
             })),
             enabled: false,
             output_file: None,
@@ -146,11 +141,9 @@ impl IpTrafficTracker {
         }
 
         let mut inner = self.inner.lock().unwrap();
-        if let Some(stats) = inner.stats.get(&ip) {
-            let stats = stats.clone();
-            drop(inner);
-            stats.add_received(bytes);
-        }
+        let stats = inner.stats.get_or_insert(ip, IpTrafficStats::new).clone();
+        drop(inner);
+        stats.add_received(bytes);
     }
 
     /// 记录发送流量（下载）
@@ -160,11 +153,9 @@ impl IpTrafficTracker {
         }
 
         let mut inner = self.inner.lock().unwrap();
-        if let Some(stats) = inner.stats.get(&ip) {
-            let stats = stats.clone();
-            drop(inner);
-            stats.add_sent(bytes);
-        }
+        let stats = inner.stats.get_or_insert(ip, IpTrafficStats::new).clone();
+        drop(inner);
+        stats.add_sent(bytes);
     }
 
     /// 获取某个 IP 的统计信息
@@ -532,6 +523,21 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_record_without_prior_connection() {
+        // 修复前：record_received/record_sent 在没有先调用 record_connection 时会静默丢弃数据
+        let tracker = IpTrafficTracker::new(100, None, None);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        tracker.record_received(ip, 1000);
+        tracker.record_sent(ip, 2000);
+
+        let stats = tracker.get_stats(&ip).unwrap();
+        assert_eq!(stats.connections, 0);
+        assert_eq!(stats.bytes_received, 1000);
+        assert_eq!(stats.bytes_sent, 2000);
     }
 
     #[test]

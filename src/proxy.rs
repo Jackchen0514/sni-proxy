@@ -8,11 +8,9 @@ use crate::metrics::Metrics;
 
 /// 优化 TCP socket 参数（流媒体专用）
 ///
-/// 为流媒体场景优化 TCP 参数：
 /// - 更大的接收/发送缓冲区 (1MB)
-/// - TCP_NODELAY 避免 Nagle 算法延迟
-/// - TCP Fast Open 减少握手延迟
-#[allow(unused_variables)]
+/// - TCP_NODELAY 禁用 Nagle 算法减少延迟
+/// - TCP Fast Open 减少握手延迟（Linux 客户端模式）
 pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
     // 设置 TCP_NODELAY（禁用 Nagle 算法，减少延迟）
     let _ = stream.set_nodelay(true);
@@ -70,12 +68,10 @@ pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
 }
 
 /// 双向代理数据传输（流媒体优化版本）
-/// ⚡ 优化：使用 tokio 零拷贝 + 批量统计，专为 Netflix/Disney+/HBO Max 等流媒体优化
 ///
 /// 性能优化：
-/// 1. 使用 tokio::io::copy_bidirectional（内核级零拷贝）
-/// 2. 批量更新统计数据，减少原子操作开销
-/// 3. 避免手动缓冲区管理
+/// 1. 使用 tokio::io::copy_bidirectional（Tokio 内部缓冲，避免手动缓冲区管理）
+/// 2. 连接结束后批量更新统计数据，减少原子操作开销
 pub async fn proxy_data(
     mut client_stream: TcpStream,
     mut target_stream: TcpStream,
@@ -83,7 +79,6 @@ pub async fn proxy_data(
     client_ip: IpAddr,
     ip_traffic_tracker: IpTrafficTracker,
 ) -> Result<()> {
-    // 使用 tokio 的零拷贝双向传输（性能最优）
     match tokio::io::copy_bidirectional(&mut client_stream, &mut target_stream).await {
         Ok((client_to_target, target_to_client)) => {
             // 批量更新统计（只在连接结束时更新一次）
