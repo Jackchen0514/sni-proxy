@@ -18,8 +18,6 @@ pub struct IpMatcher {
 struct Ipv4Network {
     network: u32,
     mask: u32,
-    #[allow(dead_code)]
-    prefix_len: u8,
 }
 
 /// IPv6 网段
@@ -27,8 +25,6 @@ struct Ipv4Network {
 struct Ipv6Network {
     network: u128,
     mask: u128,
-    #[allow(dead_code)]
-    prefix_len: u8,
 }
 
 impl IpMatcher {
@@ -113,11 +109,7 @@ impl IpMatcher {
             };
             let network = ip_u32 & mask;
 
-            ipv4_networks.push(Ipv4Network {
-                network,
-                mask,
-                prefix_len,
-            });
+            ipv4_networks.push(Ipv4Network { network, mask });
 
             let network_addr = Ipv4Addr::from(network);
             info!("添加 IPv4 网段白名单: {}/{} (网络地址: {})", ip_str, prefix_len, network_addr);
@@ -137,11 +129,7 @@ impl IpMatcher {
             };
             let network = ip_u128 & mask;
 
-            ipv6_networks.push(Ipv6Network {
-                network,
-                mask,
-                prefix_len,
-            });
+            ipv6_networks.push(Ipv6Network { network, mask });
 
             let network_addr = Ipv6Addr::from(network);
             info!("添加 IPv6 网段白名单: {}/{} (网络地址: {})", ip_str, prefix_len, network_addr);
@@ -225,13 +213,11 @@ mod tests {
             "10.0.0.0/8".to_string(),
         ]);
 
-        // 192.168.1.0/24 应该匹配 192.168.1.0 到 192.168.1.255
         assert!(matcher.matches("192.168.1.1".parse().unwrap()));
         assert!(matcher.matches("192.168.1.100".parse().unwrap()));
         assert!(matcher.matches("192.168.1.255".parse().unwrap()));
         assert!(!matcher.matches("192.168.2.1".parse().unwrap()));
 
-        // 10.0.0.0/8 应该匹配 10.0.0.0 到 10.255.255.255
         assert!(matcher.matches("10.0.0.1".parse().unwrap()));
         assert!(matcher.matches("10.255.255.255".parse().unwrap()));
         assert!(!matcher.matches("11.0.0.1".parse().unwrap()));
@@ -244,12 +230,10 @@ mod tests {
             "fe80::/10".to_string(),
         ]);
 
-        // 2001:db8::/32
         assert!(matcher.matches("2001:db8::1".parse().unwrap()));
         assert!(matcher.matches("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
         assert!(!matcher.matches("2001:db9::1".parse().unwrap()));
 
-        // fe80::/10 (link-local)
         assert!(matcher.matches("fe80::1".parse().unwrap()));
         assert!(matcher.matches("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()));
         assert!(!matcher.matches("fec0::1".parse().unwrap()));
@@ -264,15 +248,12 @@ mod tests {
             "2001:db8::/32".to_string(),
         ]);
 
-        // 精确匹配
         assert!(matcher.matches("192.168.1.1".parse().unwrap()));
         assert!(matcher.matches("::1".parse().unwrap()));
 
-        // CIDR 匹配
         assert!(matcher.matches("192.168.2.100".parse().unwrap()));
         assert!(matcher.matches("2001:db8::5".parse().unwrap()));
 
-        // 不匹配
         assert!(!matcher.matches("192.168.1.2".parse().unwrap()));
         assert!(!matcher.matches("192.168.3.1".parse().unwrap()));
         assert!(!matcher.matches("::2".parse().unwrap()));
@@ -286,15 +267,12 @@ mod tests {
             "::1".to_string(),
         ]);
 
-        // IPv4 localhost
         assert!(matcher.matches("127.0.0.1".parse().unwrap()));
         assert!(matcher.matches("127.0.0.255".parse().unwrap()));
         assert!(matcher.matches("127.255.255.255".parse().unwrap()));
 
-        // IPv6 localhost
         assert!(matcher.matches("::1".parse().unwrap()));
 
-        // 非 localhost
         assert!(!matcher.matches("192.168.1.1".parse().unwrap()));
         assert!(!matcher.matches("::2".parse().unwrap()));
     }
@@ -307,16 +285,13 @@ mod tests {
             "192.168.0.0/16".to_string(),
         ]);
 
-        // 10.0.0.0/8
         assert!(matcher.matches("10.0.0.1".parse().unwrap()));
         assert!(matcher.matches("10.255.255.255".parse().unwrap()));
 
-        // 172.16.0.0/12
         assert!(matcher.matches("172.16.0.1".parse().unwrap()));
         assert!(matcher.matches("172.31.255.255".parse().unwrap()));
         assert!(!matcher.matches("172.32.0.1".parse().unwrap()));
 
-        // 192.168.0.0/16
         assert!(matcher.matches("192.168.0.1".parse().unwrap()));
         assert!(matcher.matches("192.168.255.255".parse().unwrap()));
         assert!(!matcher.matches("192.169.0.1".parse().unwrap()));
@@ -335,22 +310,19 @@ mod tests {
 
     #[test]
     fn test_invalid_patterns() {
-        // 这些无效的模式应该被忽略，不会导致 panic
         let matcher = IpMatcher::new(vec![
             "invalid".to_string(),
             "192.168.1.1.1".to_string(),
-            "192.168.1.0/33".to_string(), // 无效的 IPv4 前缀长度
-            "2001:db8::/129".to_string(), // 无效的 IPv6 前缀长度
+            "192.168.1.0/33".to_string(),
+            "2001:db8::/129".to_string(),
             "".to_string(),
         ]);
 
-        // 无效的模式被忽略，所以匹配器应该是空的
         assert!(matcher.is_empty());
     }
 
     #[test]
     fn test_cidr_single_host() {
-        // /32 对于 IPv4 表示单个主机
         let matcher = IpMatcher::new(vec![
             "192.168.1.1/32".to_string(),
         ]);
@@ -358,7 +330,6 @@ mod tests {
         assert!(matcher.matches("192.168.1.1".parse().unwrap()));
         assert!(!matcher.matches("192.168.1.2".parse().unwrap()));
 
-        // /128 对于 IPv6 表示单个主机
         let matcher_v6 = IpMatcher::new(vec![
             "2001:db8::1/128".to_string(),
         ]);
@@ -369,7 +340,6 @@ mod tests {
 
     #[test]
     fn test_cidr_all() {
-        // 0.0.0.0/0 匹配所有 IPv4 地址
         let matcher_v4 = IpMatcher::new(vec![
             "0.0.0.0/0".to_string(),
         ]);
@@ -378,7 +348,6 @@ mod tests {
         assert!(matcher_v4.matches("8.8.8.8".parse().unwrap()));
         assert!(matcher_v4.matches("255.255.255.255".parse().unwrap()));
 
-        // ::/0 匹配所有 IPv6 地址
         let matcher_v6 = IpMatcher::new(vec![
             "::/0".to_string(),
         ]);

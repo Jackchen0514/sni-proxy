@@ -76,7 +76,8 @@ impl Metrics {
     }
 
     pub fn dec_active_connections(&self) {
-        self.inner.active_connections.fetch_sub(1, Ordering::Relaxed);
+        // Release：确保连接的所有内存写入对后续 Acquire load 可见（关闭时的计数检查）
+        self.inner.active_connections.fetch_sub(1, Ordering::Release);
     }
 
     pub fn inc_failed_connections(&self) {
@@ -133,7 +134,8 @@ impl Metrics {
     }
 
     pub fn get_active_connections(&self) -> usize {
-        self.inner.active_connections.load(Ordering::Relaxed)
+        // Acquire：与 dec_active_connections 的 Release 配对，确保优雅关闭能读到准确计数
+        self.inner.active_connections.load(Ordering::Acquire)
     }
 
     pub fn get_rejected_requests(&self) -> u64 {
@@ -217,7 +219,6 @@ impl ConnectionGuard {
         metrics.inc_total_connections();
         metrics.inc_active_connections();
 
-        // Debug: 打印连接数统计
         let total = metrics.get_total_connections();
         let active = metrics.get_active_connections();
         log::debug!("📊 新连接建立 | 总连接数: {} | 活跃连接: {}", total, active);
@@ -230,7 +231,6 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.metrics.dec_active_connections();
 
-        // Debug: 打印连接关闭后的统计
         let active = self.metrics.get_active_connections();
         let total = self.metrics.get_total_connections();
         log::debug!("📊 连接关闭 | 总连接数: {} | 活跃连接: {}", total, active);

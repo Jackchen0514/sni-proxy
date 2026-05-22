@@ -9,51 +9,48 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// IP 流量统计
-#[derive(Debug, Clone)]
-pub struct IpTrafficStats {
-    /// 接收字节数（上传）
-    bytes_received: Arc<AtomicU64>,
-    /// 发送字节数（下载）
-    bytes_sent: Arc<AtomicU64>,
-    /// 连接次数
-    connections: Arc<AtomicU64>,
+/// IP 流量统计（内部类型，通过 Mutex 访问，无需 Arc 包装各字段）
+#[derive(Debug)]
+struct IpTrafficStats {
+    bytes_received: AtomicU64,
+    bytes_sent: AtomicU64,
+    connections: AtomicU64,
 }
 
 impl IpTrafficStats {
     fn new() -> Self {
         Self {
-            bytes_received: Arc::new(AtomicU64::new(0)),
-            bytes_sent: Arc::new(AtomicU64::new(0)),
-            connections: Arc::new(AtomicU64::new(0)),
+            bytes_received: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            connections: AtomicU64::new(0),
         }
     }
 
-    pub fn add_received(&self, bytes: u64) {
+    fn add_received(&self, bytes: u64) {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn add_sent(&self, bytes: u64) {
+    fn add_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn inc_connections(&self) {
+    fn inc_connections(&self) {
         self.connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn get_received(&self) -> u64 {
+    fn get_received(&self) -> u64 {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
-    pub fn get_sent(&self) -> u64 {
+    fn get_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
     }
 
-    pub fn get_total(&self) -> u64 {
+    fn get_total(&self) -> u64 {
         self.get_received() + self.get_sent()
     }
 
-    pub fn get_connections(&self) -> u64 {
+    fn get_connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
     }
 }
@@ -72,9 +69,6 @@ pub struct IpTrafficTracker {
 struct IpTrafficTrackerInner {
     /// IP 流量统计表（使用 LRU 缓存限制内存）
     stats: LruCache<IpAddr, IpTrafficStats>,
-    /// 最大跟踪 IP 数量
-    #[allow(dead_code)]
-    max_tracked_ips: usize,
 }
 
 impl IpTrafficTracker {
@@ -85,12 +79,12 @@ impl IpTrafficTracker {
     /// * `output_file` - 统计数据输出文件路径（可选，每次覆盖写入最新数据）
     /// * `persistence_file` - 持久化数据文件路径（可选，用于服务重启后恢复数据）
     pub fn new(max_tracked_ips: usize, output_file: Option<String>, persistence_file: Option<String>) -> Self {
-        let capacity = NonZeroUsize::new(max_tracked_ips).unwrap();
+        // max(1) 防止 max_tracked_ips=0 时 unwrap panic（config 层已校验，此为防御性兜底）
+        let capacity = NonZeroUsize::new(max_tracked_ips.max(1)).unwrap();
 
         let mut tracker = Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
                 stats: LruCache::new(capacity),
-                max_tracked_ips,
             })),
             enabled: true,
             output_file,
@@ -114,7 +108,6 @@ impl IpTrafficTracker {
         Self {
             inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
                 stats: LruCache::new(NonZeroUsize::new(1).unwrap()),
-                max_tracked_ips: 0,
             })),
             enabled: false,
             output_file: None,
@@ -127,15 +120,9 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        let stats = inner
-            .stats
-            .get_or_insert(ip, || IpTrafficStats::new())
-            .clone();
-        drop(inner); // 尽早释放锁
-
-        stats.inc_connections();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .inc_connections();
         debug!("IP {} 连接计数 +1", ip);
     }
 
@@ -144,13 +131,9 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(stats) = inner.stats.get(&ip) {
-            let stats = stats.clone();
-            drop(inner);
-            stats.add_received(bytes);
-        }
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .add_received(bytes);
     }
 
     /// 记录发送流量（下载）
@@ -158,13 +141,9 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(stats) = inner.stats.get(&ip) {
-            let stats = stats.clone();
-            drop(inner);
-            stats.add_sent(bytes);
-        }
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+            .stats.get_or_insert(ip, IpTrafficStats::new)
+            .add_sent(bytes);
     }
 
     /// 获取某个 IP 的统计信息
@@ -173,7 +152,7 @@ impl IpTrafficTracker {
             return None;
         }
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.stats.peek(ip).map(|stats| IpTrafficSnapshot {
             ip: *ip,
             bytes_received: stats.get_received(),
@@ -189,7 +168,7 @@ impl IpTrafficTracker {
             return Vec::new();
         }
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .stats
             .iter()
@@ -221,7 +200,6 @@ impl IpTrafficTracker {
 
         if top_ips.is_empty() {
             info!("=== IP 流量统计（无数据） ===");
-            // 写入空数据到文件
             if let Some(ref path) = self.output_file {
                 if let Err(e) = self.write_to_file(path, &[], 0) {
                     warn!("写入统计文件失败: {}", e);
@@ -247,19 +225,16 @@ impl IpTrafficTracker {
             );
         }
 
-        // 计算总计
         let total_count = self.get_tracked_count();
         info!("{}", "-".repeat(100));
         info!("当前跟踪 IP 数量: {}", total_count);
 
-        // 写入到文件（如果配置了）
         if let Some(ref path) = self.output_file {
             if let Err(e) = self.write_to_file(path, &top_ips, total_count) {
                 warn!("写入统计文件失败: {}", e);
             }
         }
 
-        // 保存到持久化文件（如果配置了）
         if let Some(ref path) = self.persistence_file {
             if let Err(e) = self.save_to_persistence_file_internal(path) {
                 warn!("保存持久化数据失败: {}", e);
@@ -273,7 +248,6 @@ impl IpTrafficTracker {
 
         let mut file = File::create(path)?;
 
-        // 写入时间戳
         if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
             writeln!(file, "更新时间: {}", chrono::DateTime::<chrono::Local>::from(
                 SystemTime::UNIX_EPOCH + duration
@@ -315,9 +289,8 @@ impl IpTrafficTracker {
     fn save_to_persistence_file_internal(&self, path: &str) -> std::io::Result<()> {
         use std::time::SystemTime;
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        // 转换为可序列化的格式
         let mut stats_map = HashMap::new();
         for (ip, stats) in inner.stats.iter() {
             stats_map.insert(
@@ -342,7 +315,6 @@ impl IpTrafficTracker {
 
         drop(inner); // 释放锁
 
-        // 序列化并写入文件
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -365,15 +337,15 @@ impl IpTrafficTracker {
         let data: PersistenceData = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut loaded_count = 0;
 
         for (ip_str, persisted_stats) in data.stats {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 let stats = IpTrafficStats {
-                    bytes_received: Arc::new(AtomicU64::new(persisted_stats.bytes_received)),
-                    bytes_sent: Arc::new(AtomicU64::new(persisted_stats.bytes_sent)),
-                    connections: Arc::new(AtomicU64::new(persisted_stats.connections)),
+                    bytes_received: AtomicU64::new(persisted_stats.bytes_received),
+                    bytes_sent: AtomicU64::new(persisted_stats.bytes_sent),
+                    connections: AtomicU64::new(persisted_stats.connections),
                 };
                 inner.stats.put(ip, stats);
                 loaded_count += 1;
@@ -398,7 +370,7 @@ impl IpTrafficTracker {
         if !self.enabled {
             return 0;
         }
-        self.inner.lock().unwrap().stats.len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).stats.len()
     }
 
     /// 清空所有统计数据
@@ -406,7 +378,7 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.stats.clear();
         info!("IP 流量统计已清空");
     }
@@ -487,15 +459,12 @@ mod tests {
         let tracker = IpTrafficTracker::new(100, None, None);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
-        // 记录连接
         tracker.record_connection(ip);
         tracker.record_connection(ip);
 
-        // 记录流量
         tracker.record_received(ip, 1000);
         tracker.record_sent(ip, 2000);
 
-        // 获取统计
         let stats = tracker.get_stats(&ip).unwrap();
         assert_eq!(stats.connections, 2);
         assert_eq!(stats.bytes_received, 1000);
@@ -522,8 +491,8 @@ mod tests {
 
         let top = tracker.get_top_n(2);
         assert_eq!(top.len(), 2);
-        assert_eq!(top[0].ip, ip2); // 3000 bytes
-        assert_eq!(top[1].ip, ip3); // 2000 bytes
+        assert_eq!(top[0].ip, ip2);
+        assert_eq!(top[1].ip, ip3);
     }
 
     #[test]
@@ -532,6 +501,20 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_record_without_prior_connection() {
+        let tracker = IpTrafficTracker::new(100, None, None);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        tracker.record_received(ip, 1000);
+        tracker.record_sent(ip, 2000);
+
+        let stats = tracker.get_stats(&ip).unwrap();
+        assert_eq!(stats.connections, 0);
+        assert_eq!(stats.bytes_received, 1000);
+        assert_eq!(stats.bytes_sent, 2000);
     }
 
     #[test]

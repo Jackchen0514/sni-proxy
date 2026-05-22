@@ -6,6 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+/// SOCKS5 握手各阶段统一 I/O 超时
+const SOCKS5_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// SOCKS5 代理配置
 #[derive(Debug, Clone)]
 pub struct Socks5Config {
@@ -37,7 +40,7 @@ pub async fn connect_via_socks5(
 
     // ============ 步骤 1: 连接到 SOCKS5 服务器 ============
     let mut socks5_stream = match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         TcpStream::connect(&socks5_config.addr)
     ).await {
         Ok(Ok(stream)) => stream,
@@ -75,14 +78,6 @@ pub async fn connect_via_socks5(
 
     debug!("已连接到 SOCKS5 服务器: {}", socks5_config.addr);
 
-    // ============ 步骤 3: SOCKS5 握手 - 版本识别请求 ============
-    // 构建 SOCKS5 请求：
-    // +----+-----+-------+------+----------+----------+
-    // |VER | NMD | FLAGS | RSV  | ADDRTYPE | DST.ADDR | DST.PORT |
-    // +----+-----+-------+------+----------+----------+
-    // | 1  |  1  |   1   | 1    |    1     | Variable |    2     |
-    // +----+-----+-------+------+----------+----------+
-
     let mut request = Vec::new();
     request.push(5u8);  // SOCKS 版本 5
 
@@ -97,7 +92,7 @@ pub async fn connect_via_socks5(
 
     // 发送握手请求
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.write_all(&request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 握手请求"),
@@ -108,7 +103,7 @@ pub async fn connect_via_socks5(
     // ============ 步骤 4: 读取握手响应 ============
     let mut response = [0u8; 2];
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.read_exact(&mut response)
     ).await {
         Ok(Ok(n)) => {
@@ -128,7 +123,6 @@ pub async fn connect_via_socks5(
     if response[1] == 2 {
         // 用户名/密码认证
         if let (Some(username), Some(password)) = (&socks5_config.username, &socks5_config.password) {
-            // 构建认证请求
             let mut auth_request = Vec::new();
             auth_request.push(1u8);  // 版本 1
             auth_request.push(username.len() as u8);
@@ -136,9 +130,8 @@ pub async fn connect_via_socks5(
             auth_request.push(password.len() as u8);
             auth_request.extend_from_slice(password.as_bytes());
 
-            // 发送认证请求
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.write_all(&auth_request)
             ).await {
                 Ok(Ok(())) => debug!("已发送认证请求"),
@@ -146,10 +139,9 @@ pub async fn connect_via_socks5(
                 Err(_) => return Err(anyhow::anyhow!("发送认证请求超时")),
             }
 
-            // 读取认证响应
             let mut auth_response = [0u8; 2];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut auth_response)
             ).await {
                 Ok(Ok(_)) => {},
@@ -167,21 +159,6 @@ pub async fn connect_via_socks5(
     }
 
     // ============ 步骤 6: 发送连接请求 ============
-    // 构建连接请求：
-    // +----+-----+-------+------+----------+----------+
-    // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-    // +----+-----+-------+------+----------+----------+
-    // | 1  |  1  | X'00' |  1   | Variable |    2     |
-    // +----+-----+-------+------+----------+----------+
-    // CMD:
-    //   o  CONNECT X'01'
-    //   o  BIND X'02'
-    //   o  UDP ASSOCIATE X'03'
-    // ATYP:
-    //   o  IPv4 address: X'01'
-    //   o  DOMAINNAME: X'03'
-    //   o  IPv6 address: X'04'
-
     let mut connect_request = Vec::new();
     connect_request.push(5u8);   // SOCKS 版本 5
     connect_request.push(1u8);   // 连接命令 (CONNECT)
@@ -198,9 +175,8 @@ pub async fn connect_via_socks5(
     // 目标端口（网络字节序）
     connect_request.extend_from_slice(&target_port.to_be_bytes());
 
-    // 发送连接请求
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.write_all(&connect_request)
     ).await {
         Ok(Ok(())) => debug!("已发送 SOCKS5 连接请求"),
@@ -211,7 +187,7 @@ pub async fn connect_via_socks5(
     // ============ 步骤 7: 读取连接响应 ============
     let mut response = [0u8; 4];
     match timeout(
-        Duration::from_secs(5),
+        SOCKS5_IO_TIMEOUT,
         socks5_stream.read_exact(&mut response)
     ).await {
         Ok(Ok(_)) => {},
@@ -238,13 +214,12 @@ pub async fn connect_via_socks5(
     }
 
     // ============ 步骤 8: 读取剩余的响应数据 ============
-    // 根据地址类型读取相应的数据
     match response[3] {
         1 => {
             // IPv4: 需要读 4 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 6];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
                 Ok(Ok(_)) => {},
@@ -260,7 +235,7 @@ pub async fn connect_via_socks5(
             // IPv6: 需要读 16 个字节 IP + 2 个字节端口
             let mut addr_data = [0u8; 18];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut addr_data)
             ).await {
                 Ok(Ok(_)) => {},
@@ -275,7 +250,7 @@ pub async fn connect_via_socks5(
             // 域名: 需要读 1 个字节长度 + N 个字节域名 + 2 个字节端口
             let mut len_buf = [0u8; 1];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut len_buf)
             ).await {
                 Ok(Ok(_)) => {},
@@ -284,9 +259,12 @@ pub async fn connect_via_socks5(
             }
 
             let domain_len = len_buf[0] as usize;
+            if domain_len > 253 {
+                return Err(anyhow::anyhow!("SOCKS5 响应中域名长度无效: {}", domain_len));
+            }
             let mut domain_data = vec![0u8; domain_len + 2];
             match timeout(
-                Duration::from_secs(5),
+                SOCKS5_IO_TIMEOUT,
                 socks5_stream.read_exact(&mut domain_data)
             ).await {
                 Ok(Ok(_)) => {},

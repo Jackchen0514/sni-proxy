@@ -57,9 +57,9 @@ EXPOSE 8443
 # 设置环境变量
 ENV RUST_LOG=info
 
-# 健康检查
+# 健康检查：尝试建立 TCP 连接验证代理端口是否在监听
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD test -f /proc/1/status || exit 1
+    CMD bash -c '</dev/tcp/localhost/8443' 2>/dev/null || exit 1
 
-# 启动命令 - 如果存在 config.json 则使用它，否则使用示例配置
-CMD ["/app/sni-proxy", "config.json"]
+# 启动命令 - 如果存在 config.json 则使用它，否则回退到示例配置
+CMD ["sh", "-c", "if [ -f /app/config.json ]; then exec /app/sni-proxy /app/config.json; else exec /app/sni-proxy /app/config.example.json; fi"]
