@@ -78,14 +78,6 @@ pub async fn connect_via_socks5(
 
     debug!("已连接到 SOCKS5 服务器: {}", socks5_config.addr);
 
-    // ============ 步骤 3: SOCKS5 握手 - 版本识别请求 ============
-    // 构建 SOCKS5 请求：
-    // +----+-----+-------+------+----------+----------+
-    // |VER | NMD | FLAGS | RSV  | ADDRTYPE | DST.ADDR | DST.PORT |
-    // +----+-----+-------+------+----------+----------+
-    // | 1  |  1  |   1   | 1    |    1     | Variable |    2     |
-    // +----+-----+-------+------+----------+----------+
-
     let mut request = Vec::new();
     request.push(5u8);  // SOCKS 版本 5
 
@@ -131,7 +123,6 @@ pub async fn connect_via_socks5(
     if response[1] == 2 {
         // 用户名/密码认证
         if let (Some(username), Some(password)) = (&socks5_config.username, &socks5_config.password) {
-            // 构建认证请求
             let mut auth_request = Vec::new();
             auth_request.push(1u8);  // 版本 1
             auth_request.push(username.len() as u8);
@@ -139,7 +130,6 @@ pub async fn connect_via_socks5(
             auth_request.push(password.len() as u8);
             auth_request.extend_from_slice(password.as_bytes());
 
-            // 发送认证请求
             match timeout(
                 SOCKS5_IO_TIMEOUT,
                 socks5_stream.write_all(&auth_request)
@@ -149,7 +139,6 @@ pub async fn connect_via_socks5(
                 Err(_) => return Err(anyhow::anyhow!("发送认证请求超时")),
             }
 
-            // 读取认证响应
             let mut auth_response = [0u8; 2];
             match timeout(
                 SOCKS5_IO_TIMEOUT,
@@ -170,21 +159,6 @@ pub async fn connect_via_socks5(
     }
 
     // ============ 步骤 6: 发送连接请求 ============
-    // 构建连接请求：
-    // +----+-----+-------+------+----------+----------+
-    // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-    // +----+-----+-------+------+----------+----------+
-    // | 1  |  1  | X'00' |  1   | Variable |    2     |
-    // +----+-----+-------+------+----------+----------+
-    // CMD:
-    //   o  CONNECT X'01'
-    //   o  BIND X'02'
-    //   o  UDP ASSOCIATE X'03'
-    // ATYP:
-    //   o  IPv4 address: X'01'
-    //   o  DOMAINNAME: X'03'
-    //   o  IPv6 address: X'04'
-
     let mut connect_request = Vec::new();
     connect_request.push(5u8);   // SOCKS 版本 5
     connect_request.push(1u8);   // 连接命令 (CONNECT)
@@ -201,7 +175,6 @@ pub async fn connect_via_socks5(
     // 目标端口（网络字节序）
     connect_request.extend_from_slice(&target_port.to_be_bytes());
 
-    // 发送连接请求
     match timeout(
         SOCKS5_IO_TIMEOUT,
         socks5_stream.write_all(&connect_request)
@@ -241,7 +214,6 @@ pub async fn connect_via_socks5(
     }
 
     // ============ 步骤 8: 读取剩余的响应数据 ============
-    // 根据地址类型读取相应的数据
     match response[3] {
         1 => {
             // IPv4: 需要读 4 个字节 IP + 2 个字节端口

@@ -107,16 +107,12 @@ impl DomainIpTracker {
         let socks5_marker = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         for domain in domains {
             if let Some(ips) = data.get(domain) {
-                // 将 IP 转换为 Vec 并排序
                 let mut ip_list: Vec<_> = ips.iter().collect();
                 ip_list.sort();
 
-                // 检查是否只包含 SOCKS5 标记
                 if ip_list.len() == 1 && *ip_list[0] == socks5_marker {
-                    // SOCKS5 流量
                     writeln!(file, "{} -> [SOCKS5]", domain)?;
                 } else {
-                    // 格式化输出，过滤掉 SOCKS5 标记
                     let ip_str = ip_list
                         .iter()
                         .filter(|ip| ***ip != socks5_marker)
@@ -125,13 +121,10 @@ impl DomainIpTracker {
                         .join(", ");
 
                     if ip_str.is_empty() {
-                        // 只有 SOCKS5 标记（理论上不会到这里）
                         writeln!(file, "{} -> [SOCKS5]", domain)?;
                     } else if ips.contains(&socks5_marker) {
-                        // 既有直连 IP 又有 SOCKS5
                         writeln!(file, "{} -> {} [也通过SOCKS5]", domain, ip_str)?;
                     } else {
-                        // 仅直连 IP
                         writeln!(file, "{} -> {}", domain, ip_str)?;
                     }
                 }

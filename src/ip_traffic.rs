@@ -200,7 +200,6 @@ impl IpTrafficTracker {
 
         if top_ips.is_empty() {
             info!("=== IP 流量统计（无数据） ===");
-            // 写入空数据到文件
             if let Some(ref path) = self.output_file {
                 if let Err(e) = self.write_to_file(path, &[], 0) {
                     warn!("写入统计文件失败: {}", e);
@@ -226,19 +225,16 @@ impl IpTrafficTracker {
             );
         }
 
-        // 计算总计
         let total_count = self.get_tracked_count();
         info!("{}", "-".repeat(100));
         info!("当前跟踪 IP 数量: {}", total_count);
 
-        // 写入到文件（如果配置了）
         if let Some(ref path) = self.output_file {
             if let Err(e) = self.write_to_file(path, &top_ips, total_count) {
                 warn!("写入统计文件失败: {}", e);
             }
         }
 
-        // 保存到持久化文件（如果配置了）
         if let Some(ref path) = self.persistence_file {
             if let Err(e) = self.save_to_persistence_file_internal(path) {
                 warn!("保存持久化数据失败: {}", e);
@@ -252,7 +248,6 @@ impl IpTrafficTracker {
 
         let mut file = File::create(path)?;
 
-        // 写入时间戳
         if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
             writeln!(file, "更新时间: {}", chrono::DateTime::<chrono::Local>::from(
                 SystemTime::UNIX_EPOCH + duration
@@ -296,7 +291,6 @@ impl IpTrafficTracker {
 
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        // 转换为可序列化的格式
         let mut stats_map = HashMap::new();
         for (ip, stats) in inner.stats.iter() {
             stats_map.insert(
@@ -321,7 +315,6 @@ impl IpTrafficTracker {
 
         drop(inner); // 释放锁
 
-        // 序列化并写入文件
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -466,15 +459,12 @@ mod tests {
         let tracker = IpTrafficTracker::new(100, None, None);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
-        // 记录连接
         tracker.record_connection(ip);
         tracker.record_connection(ip);
 
-        // 记录流量
         tracker.record_received(ip, 1000);
         tracker.record_sent(ip, 2000);
 
-        // 获取统计
         let stats = tracker.get_stats(&ip).unwrap();
         assert_eq!(stats.connections, 2);
         assert_eq!(stats.bytes_received, 1000);
@@ -501,8 +491,8 @@ mod tests {
 
         let top = tracker.get_top_n(2);
         assert_eq!(top.len(), 2);
-        assert_eq!(top[0].ip, ip2); // 3000 bytes
-        assert_eq!(top[1].ip, ip3); // 2000 bytes
+        assert_eq!(top[0].ip, ip2);
+        assert_eq!(top[1].ip, ip3);
     }
 
     #[test]
@@ -515,7 +505,6 @@ mod tests {
 
     #[test]
     fn test_record_without_prior_connection() {
-        // 修复前：record_received/record_sent 在没有先调用 record_connection 时会静默丢弃数据
         let tracker = IpTrafficTracker::new(100, None, None);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 

@@ -219,7 +219,6 @@ impl ConnectionGuard {
         metrics.inc_total_connections();
         metrics.inc_active_connections();
 
-        // Debug: 打印连接数统计
         let total = metrics.get_total_connections();
         let active = metrics.get_active_connections();
         log::debug!("📊 新连接建立 | 总连接数: {} | 活跃连接: {}", total, active);
@@ -232,7 +231,6 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.metrics.dec_active_connections();
 
-        // Debug: 打印连接关闭后的统计
         let active = self.metrics.get_active_connections();
         let total = self.metrics.get_total_connections();
         log::debug!("📊 连接关闭 | 总连接数: {} | 活跃连接: {}", total, active);
