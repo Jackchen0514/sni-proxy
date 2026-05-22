@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_ip_traffic_tracker() {
-        let tracker = IpTrafficTracker::new(100, None);
+        let tracker = IpTrafficTracker::new(100, None, None);
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
         // 记录连接
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_top_n() {
-        let tracker = IpTrafficTracker::new(100, None);
+        let tracker = IpTrafficTracker::new(100, None, None);
 
         let ip1: IpAddr = "192.168.1.1".parse().unwrap();
         let ip2: IpAddr = "192.168.1.2".parse().unwrap();

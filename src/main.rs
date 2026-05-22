@@ -382,22 +382,30 @@ async fn async_main() -> Result<()> {
     }
 
     // 显示直连白名单
-    log::info!("加载了 {} 个直连白名单域名", config.whitelist.len());
-    for (i, domain) in config.whitelist.iter().take(10).enumerate() {
-        log::info!("  [直连 {}] {}", i + 1, domain);
-    }
-    if config.whitelist.len() > 10 {
-        log::info!("  ... 还有 {} 个直连域名", config.whitelist.len() - 10);
+    if config.whitelist.contains(&"*".to_string()) {
+        log::info!("直连白名单: 匹配所有域名（*）");
+    } else {
+        log::info!("加载了 {} 个直连白名单域名", config.whitelist.len());
+        for (i, domain) in config.whitelist.iter().take(10).enumerate() {
+            log::info!("  [直连 {}] {}", i + 1, domain);
+        }
+        if config.whitelist.len() > 10 {
+            log::info!("  ... 还有 {} 个直连域名", config.whitelist.len() - 10);
+        }
     }
 
     // 显示 SOCKS5 白名单
     if !config.socks5_whitelist.is_empty() {
-        log::info!("加载了 {} 个 SOCKS5 白名单域名", config.socks5_whitelist.len());
-        for (i, domain) in config.socks5_whitelist.iter().take(10).enumerate() {
-            log::info!("  [SOCKS5 {}] {}", i + 1, domain);
-        }
-        if config.socks5_whitelist.len() > 10 {
-            log::info!("  ... 还有 {} 个 SOCKS5 域名", config.socks5_whitelist.len() - 10);
+        if config.socks5_whitelist.contains(&"*".to_string()) {
+            log::info!("SOCKS5 白名单: 匹配所有域名（*）");
+        } else {
+            log::info!("加载了 {} 个 SOCKS5 白名单域名", config.socks5_whitelist.len());
+            for (i, domain) in config.socks5_whitelist.iter().take(10).enumerate() {
+                log::info!("  [SOCKS5 {}] {}", i + 1, domain);
+            }
+            if config.socks5_whitelist.len() > 10 {
+                log::info!("  ... 还有 {} 个 SOCKS5 域名", config.socks5_whitelist.len() - 10);
+            }
         }
     }
 
