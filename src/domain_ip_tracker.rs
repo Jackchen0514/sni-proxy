@@ -1,6 +1,6 @@
 use log::info;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::io::Write as IoWrite;
@@ -47,7 +47,7 @@ impl DomainIpTracker {
             return;
         }
 
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         data.entry(domain.to_string())
             .or_insert_with(HashSet::new)
             .insert(ip);
@@ -61,8 +61,8 @@ impl DomainIpTracker {
         }
 
         // 使用 0.0.0.0 作为 SOCKS5 流量的标记
-        let socks5_marker = "0.0.0.0".parse::<IpAddr>().unwrap();
-        let mut data = self.data.lock().unwrap();
+        let socks5_marker = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         data.entry(domain.to_string())
             .or_insert_with(HashSet::new)
             .insert(socks5_marker);
@@ -70,7 +70,7 @@ impl DomainIpTracker {
 
     /// 获取统计信息
     pub fn get_stats(&self) -> (usize, usize) {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let domain_count = data.len();
         let ip_count: usize = data.values().map(|ips| ips.len()).sum();
         (domain_count, ip_count)
@@ -87,7 +87,7 @@ impl DomainIpTracker {
             None => return Ok(()), // 没有指定输出文件，直接返回
         };
 
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
 
         // 创建或覆盖文件
         let mut file = File::create(output_path)?;
@@ -104,7 +104,7 @@ impl DomainIpTracker {
         domains.sort();
 
         // 写入每个域名及其 IP 列表
-        let socks5_marker = "0.0.0.0".parse::<IpAddr>().unwrap();
+        let socks5_marker = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         for domain in domains {
             if let Some(ips) = data.get(domain) {
                 // 将 IP 转换为 Vec 并排序

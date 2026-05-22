@@ -159,12 +159,12 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    // 提取域名并验证格式
-    let name = String::from_utf8(data[pos..pos + name_len].to_vec()).ok()?;
-    if !is_valid_sni_hostname(&name) {
+    // 提取域名并验证格式（避免不必要的堆分配）
+    let name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?;
+    if !is_valid_sni_hostname(name) {
         return None;
     }
-    Some(name)
+    Some(name.to_owned())
 }
 
 /// 验证 SNI 主机名格式（RFC 1123）

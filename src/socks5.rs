@@ -287,6 +287,9 @@ pub async fn connect_via_socks5(
             }
 
             let domain_len = len_buf[0] as usize;
+            if domain_len > 253 {
+                return Err(anyhow::anyhow!("SOCKS5 响应中域名长度无效: {}", domain_len));
+            }
             let mut domain_data = vec![0u8; domain_len + 2];
             match timeout(
                 SOCKS5_IO_TIMEOUT,

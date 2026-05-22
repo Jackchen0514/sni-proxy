@@ -120,7 +120,7 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-        self.inner.lock().unwrap()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
             .stats.get_or_insert(ip, IpTrafficStats::new)
             .inc_connections();
         debug!("IP {} 连接计数 +1", ip);
@@ -131,7 +131,7 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-        self.inner.lock().unwrap()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
             .stats.get_or_insert(ip, IpTrafficStats::new)
             .add_received(bytes);
     }
@@ -141,7 +141,7 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-        self.inner.lock().unwrap()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
             .stats.get_or_insert(ip, IpTrafficStats::new)
             .add_sent(bytes);
     }
@@ -152,7 +152,7 @@ impl IpTrafficTracker {
             return None;
         }
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.stats.peek(ip).map(|stats| IpTrafficSnapshot {
             ip: *ip,
             bytes_received: stats.get_received(),
@@ -168,7 +168,7 @@ impl IpTrafficTracker {
             return Vec::new();
         }
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .stats
             .iter()
@@ -294,7 +294,7 @@ impl IpTrafficTracker {
     fn save_to_persistence_file_internal(&self, path: &str) -> std::io::Result<()> {
         use std::time::SystemTime;
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // 转换为可序列化的格式
         let mut stats_map = HashMap::new();
@@ -344,7 +344,7 @@ impl IpTrafficTracker {
         let data: PersistenceData = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut loaded_count = 0;
 
         for (ip_str, persisted_stats) in data.stats {
@@ -377,7 +377,7 @@ impl IpTrafficTracker {
         if !self.enabled {
             return 0;
         }
-        self.inner.lock().unwrap().stats.len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).stats.len()
     }
 
     /// 清空所有统计数据
@@ -385,7 +385,7 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.stats.clear();
         info!("IP 流量统计已清空");
     }

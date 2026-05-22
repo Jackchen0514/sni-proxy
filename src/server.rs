@@ -288,7 +288,8 @@ impl SniProxy {
                 loop {
                     interval.tick().await;
                     info!("💾 定期保存 IP 流量统计数据...");
-                    ip_traffic_tracker_clone.save_to_persistence_file();
+                    let tracker = ip_traffic_tracker_clone.clone();
+                    tokio::task::spawn_blocking(move || tracker.save_to_persistence_file()).await.ok();
                 }
             });
             info!("✅ IP 流量追踪定期保存已启用（每 5 分钟）");
@@ -313,8 +314,12 @@ impl SniProxy {
                 loop {
                     interval.tick().await;
                     info!("💾 定期保存域名-IP 映射数据...");
-                    if let Err(e) = domain_ip_tracker_clone.save_to_file() {
-                        error!("保存域名-IP 映射失败: {}", e);
+                    let tracker = domain_ip_tracker_clone.clone();
+                    let result = tokio::task::spawn_blocking(move || tracker.save_to_file()).await;
+                    match result {
+                        Ok(Err(e)) => error!("保存域名-IP 映射失败: {}", e),
+                        Err(e) => error!("保存域名-IP 映射任务崩溃: {}", e),
+                        Ok(Ok(())) => {}
                     }
                 }
             });
@@ -356,14 +361,26 @@ impl SniProxy {
                             // 保存 IP 流量统计数据
                             if self.ip_traffic_tracker.is_enabled() {
                                 info!("💾 保存 IP 流量统计数据...");
-                                self.ip_traffic_tracker.save_to_persistence_file();
+                                let tracker = self.ip_traffic_tracker.clone();
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    tokio::task::spawn_blocking(move || tracker.save_to_persistence_file()),
+                                ).await;
                             }
 
                             // 保存域名-IP 映射数据
                             if self.domain_ip_tracker.is_enabled() {
                                 info!("💾 保存域名-IP 映射数据...");
-                                if let Err(e) = self.domain_ip_tracker.save_to_file() {
-                                    error!("保存域名-IP 映射失败: {}", e);
+                                let tracker = self.domain_ip_tracker.clone();
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    tokio::task::spawn_blocking(move || tracker.save_to_file()),
+                                ).await;
+                                match result {
+                                    Ok(Ok(Err(e))) => error!("保存域名-IP 映射失败: {}", e),
+                                    Ok(Err(e)) => error!("保存域名-IP 映射任务崩溃: {}", e),
+                                    Err(_) => error!("保存域名-IP 映射超时"),
+                                    Ok(Ok(Ok(()))) => {}
                                 }
                             }
 
@@ -688,19 +705,27 @@ async fn handle_connection(
         };
 
         // 尝试连接到第一个 IP
-        let target_addr = (resolved_ips[0], 443);
+        let first_ip = match resolved_ips.first() {
+            Some(ip) => *ip,
+            None => {
+                error!("DNS 解析返回空 IP 列表: {}", sni);
+                metrics.inc_failed_connections();
+                return Ok(());
+            }
+        };
+        let target_addr = (first_ip, 443);
         match timeout(
             Duration::from_secs(connect_timeout_secs),
             TcpStream::connect(target_addr)
         ).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                error!("连接到目标服务器 {}:{} 失败: {}", resolved_ips[0], 443, e);
+                error!("连接到目标服务器 {}:{} 失败: {}", first_ip, 443, e);
                 metrics.inc_failed_connections();
                 return Ok(());
             }
             Err(_) => {
-                error!("连接到目标服务器 {}:{} 超时", resolved_ips[0], 443);
+                error!("连接到目标服务器 {}:{} 超时", first_ip, 443);
                 metrics.inc_connection_timeouts();
                 metrics.inc_failed_connections();
                 return Ok(());
