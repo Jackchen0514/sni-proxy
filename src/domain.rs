@@ -1,9 +1,11 @@
 use log::info;
 use std::collections::HashSet;
 
-/// 域名匹配器，支持精确匹配和通配符匹配
+/// 域名匹配器，支持精确匹配、通配符匹配和全匹配
 #[derive(Debug, Clone)]
 pub struct DomainMatcher {
+    /// 是否匹配所有域名（配置了 "*"）
+    match_all: bool,
     /// 精确匹配的域名列表
     exact_domains: HashSet<String>,
     /// 通配符域名列表（例如 "*.example.com"），已排序以优化匹配
@@ -12,15 +14,25 @@ pub struct DomainMatcher {
 
 impl DomainMatcher {
     /// 创建新的域名匹配器
+    ///
+    /// 支持三种模式：
+    /// - `"*"` — 匹配所有域名
+    /// - `"*.example.com"` — 匹配 example.com 的所有子域名
+    /// - `"example.com"` — 精确匹配
     pub fn new(domains: Vec<String>) -> Self {
+        let mut match_all = false;
         let mut exact_domains = HashSet::new();
         let mut wildcard_domains = Vec::new();
 
         for domain in domains {
             let domain_lower = domain.to_lowercase(); // 统一转换为小写
 
-            if domain_lower.starts_with("*.") {
-                // 通配符域名
+            if domain_lower == "*" {
+                // 全域名通配符，匹配所有域名
+                match_all = true;
+                info!("配置为匹配所有域名（通配符 *）");
+            } else if domain_lower.starts_with("*.") {
+                // 子域名通配符
                 let suffix = domain_lower[2..].to_string();
                 if !suffix.is_empty() {
                     wildcard_domains.push(suffix);
@@ -37,6 +49,7 @@ impl DomainMatcher {
         wildcard_domains.sort_by(|a, b| b.len().cmp(&a.len()));
 
         Self {
+            match_all,
             exact_domains,
             wildcard_domains,
         }
@@ -45,6 +58,11 @@ impl DomainMatcher {
     /// 检查域名是否匹配白名单
     #[inline]
     pub fn matches(&self, domain: &str) -> bool {
+        // 全域名通配符：直接放行
+        if self.match_all {
+            return true;
+        }
+
         let domain_lower = domain.to_lowercase();
 
         // 先检查精确匹配（O(1)）
@@ -70,6 +88,10 @@ impl DomainMatcher {
     /// 获取所有域名模式（用于 DNS 预热等场景）
     /// 返回格式：精确域名 + 通配符域名（带 "*." 前缀）
     pub fn get_patterns(&self) -> Vec<String> {
+        if self.match_all {
+            return vec!["*".to_string()];
+        }
+
         let mut patterns = Vec::new();
 
         // 添加精确匹配域名
@@ -186,6 +208,24 @@ mod tests {
 
         assert!(!matcher.matches("example.com"));
         assert!(!matcher.matches("www.example.com"));
+    }
+
+    #[test]
+    fn test_domain_matcher_match_all() {
+        let matcher = DomainMatcher::new(vec!["*".to_string()]);
+
+        assert!(matcher.matches("example.com"));
+        assert!(matcher.matches("www.example.com"));
+        assert!(matcher.matches("anything.test"));
+        assert!(matcher.matches("UPPERCASE.COM"));
+        assert!(matcher.matches("a.b.c.d.e.f"));
+    }
+
+    #[test]
+    fn test_domain_matcher_match_all_get_patterns() {
+        let matcher = DomainMatcher::new(vec!["*".to_string()]);
+        let patterns = matcher.get_patterns();
+        assert_eq!(patterns, vec!["*".to_string()]);
     }
 
     #[test]
