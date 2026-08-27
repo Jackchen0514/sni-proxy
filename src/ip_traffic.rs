@@ -1,8 +1,10 @@
 use log::{debug, info, warn};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
@@ -55,10 +57,20 @@ impl IpTrafficStats {
     }
 }
 
+/// 单个分片：独立加锁的 LRU 表
+struct IpTrafficShard {
+    stats: Mutex<LruCache<IpAddr, IpTrafficStats>>,
+}
+
 /// IP 流量追踪器
+///
+/// 内部按 IP 哈希分片存储（而不是单个全局 `Mutex<HashMap>`）：开启该功能后，
+/// `record_connection`/`record_received`/`record_sent` 会在每个连接的关键路径上
+/// 被调用，如果所有连接都抢同一把锁，会成为高并发下的争用热点。分片后不同 IP
+/// 大概率落在不同分片，锁粒度从"全局"降到"1/N"。
 #[derive(Clone)]
 pub struct IpTrafficTracker {
-    inner: Arc<Mutex<IpTrafficTrackerInner>>,
+    shards: Arc<Vec<IpTrafficShard>>,
     enabled: bool,
     /// 统计数据输出文件路径（可选）
     output_file: Option<String>,
@@ -66,26 +78,25 @@ pub struct IpTrafficTracker {
     persistence_file: Option<String>,
 }
 
-struct IpTrafficTrackerInner {
-    /// IP 流量统计表（使用 LRU 缓存限制内存）
-    stats: LruCache<IpAddr, IpTrafficStats>,
-}
-
 impl IpTrafficTracker {
     /// 创建新的 IP 流量追踪器
     ///
     /// # 参数
-    /// * `max_tracked_ips` - 最大跟踪的 IP 数量（使用 LRU，超过后会淘汰最少使用的）
+    /// * `max_tracked_ips` - 最大跟踪的 IP 数量（分摊到各分片，每分片用 LRU 淘汰）
     /// * `output_file` - 统计数据输出文件路径（可选，每次覆盖写入最新数据）
     /// * `persistence_file` - 持久化数据文件路径（可选，用于服务重启后恢复数据）
     pub fn new(max_tracked_ips: usize, output_file: Option<String>, persistence_file: Option<String>) -> Self {
-        // max(1) 防止 max_tracked_ips=0 时 unwrap panic（config 层已校验，此为防御性兜底）
-        let capacity = NonZeroUsize::new(max_tracked_ips.max(1)).unwrap();
+        let shard_count = num_cpus::get().max(1).next_power_of_two().clamp(4, 32);
+        // max(1) 防止 max_tracked_ips=0 时分片容量为 0 导致 unwrap panic（config 层已校验，此为防御性兜底）
+        let per_shard_capacity = (max_tracked_ips.max(1) / shard_count).max(1);
+        let shards: Vec<IpTrafficShard> = (0..shard_count)
+            .map(|_| IpTrafficShard {
+                stats: Mutex::new(LruCache::new(NonZeroUsize::new(per_shard_capacity).unwrap())),
+            })
+            .collect();
 
         let mut tracker = Self {
-            inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
-                stats: LruCache::new(capacity),
-            })),
+            shards: Arc::new(shards),
             enabled: true,
             output_file,
             persistence_file: persistence_file.clone(),
@@ -106,13 +117,21 @@ impl IpTrafficTracker {
     /// 创建禁用的追踪器（不进行任何统计）
     pub fn disabled() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(IpTrafficTrackerInner {
-                stats: LruCache::new(NonZeroUsize::new(1).unwrap()),
-            })),
+            shards: Arc::new(vec![IpTrafficShard {
+                stats: Mutex::new(LruCache::new(NonZeroUsize::new(1).unwrap())),
+            }]),
             enabled: false,
             output_file: None,
             persistence_file: None,
         }
+    }
+
+    /// 根据 IP 选择对应的分片
+    fn shard_for(&self, ip: &IpAddr) -> &IpTrafficShard {
+        let mut hasher = DefaultHasher::new();
+        ip.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.shards.len();
+        &self.shards[idx]
     }
 
     /// 记录连接
@@ -120,8 +139,11 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-            .stats.get_or_insert(ip, IpTrafficStats::new)
+        self.shard_for(&ip)
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(ip, IpTrafficStats::new)
             .inc_connections();
         debug!("IP {} 连接计数 +1", ip);
     }
@@ -131,8 +153,11 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-            .stats.get_or_insert(ip, IpTrafficStats::new)
+        self.shard_for(&ip)
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(ip, IpTrafficStats::new)
             .add_received(bytes);
     }
 
@@ -141,8 +166,11 @@ impl IpTrafficTracker {
         if !self.enabled || bytes == 0 {
             return;
         }
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-            .stats.get_or_insert(ip, IpTrafficStats::new)
+        self.shard_for(&ip)
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(ip, IpTrafficStats::new)
             .add_sent(bytes);
     }
 
@@ -152,8 +180,8 @@ impl IpTrafficTracker {
             return None;
         }
 
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.stats.peek(ip).map(|stats| IpTrafficSnapshot {
+        let inner = self.shard_for(ip).stats.lock().unwrap_or_else(|e| e.into_inner());
+        inner.peek(ip).map(|stats| IpTrafficSnapshot {
             ip: *ip,
             bytes_received: stats.get_received(),
             bytes_sent: stats.get_sent(),
@@ -168,18 +196,18 @@ impl IpTrafficTracker {
             return Vec::new();
         }
 
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner
-            .stats
-            .iter()
-            .map(|(ip, stats)| IpTrafficSnapshot {
+        let mut result = Vec::new();
+        for shard in self.shards.iter() {
+            let inner = shard.stats.lock().unwrap_or_else(|e| e.into_inner());
+            result.extend(inner.iter().map(|(ip, stats)| IpTrafficSnapshot {
                 ip: *ip,
                 bytes_received: stats.get_received(),
                 bytes_sent: stats.get_sent(),
                 total_bytes: stats.get_total(),
                 connections: stats.get_connections(),
-            })
-            .collect()
+            }));
+        }
+        result
     }
 
     /// 获取流量最大的 TOP N
@@ -191,6 +219,12 @@ impl IpTrafficTracker {
     }
 
     /// 打印统计摘要
+    ///
+    /// 注意：不在这里同步保存持久化数据——那是独立的定时任务
+    /// （每 5 分钟一次，通过 `spawn_blocking` 执行，见 `server.rs`）的职责；
+    /// 这里只负责日志输出和（可选的）统计文件写入，文件写入通过
+    /// [`spawn_write_to_file`](Self::spawn_write_to_file) 丢给阻塞线程池，
+    /// 避免同步磁盘 I/O 占用 tokio worker 线程、造成延迟毛刺。
     pub fn print_summary(&self, top_n: usize) {
         if !self.enabled {
             return;
@@ -200,11 +234,7 @@ impl IpTrafficTracker {
 
         if top_ips.is_empty() {
             info!("=== IP 流量统计（无数据） ===");
-            if let Some(ref path) = self.output_file {
-                if let Err(e) = self.write_to_file(path, &[], 0) {
-                    warn!("写入统计文件失败: {}", e);
-                }
-            }
+            self.spawn_write_to_file(Vec::new(), 0);
             return;
         }
 
@@ -229,78 +259,38 @@ impl IpTrafficTracker {
         info!("{}", "-".repeat(100));
         info!("当前跟踪 IP 数量: {}", total_count);
 
-        if let Some(ref path) = self.output_file {
-            if let Err(e) = self.write_to_file(path, &top_ips, total_count) {
-                warn!("写入统计文件失败: {}", e);
-            }
-        }
-
-        if let Some(ref path) = self.persistence_file {
-            if let Err(e) = self.save_to_persistence_file_internal(path) {
-                warn!("保存持久化数据失败: {}", e);
-            }
-        }
+        self.spawn_write_to_file(top_ips, total_count);
     }
 
-    /// 写入统计数据到文件（覆盖写入）
-    fn write_to_file(&self, path: &str, top_ips: &[IpTrafficSnapshot], total_count: usize) -> std::io::Result<()> {
-        use std::time::SystemTime;
-
-        let mut file = File::create(path)?;
-
-        if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-            writeln!(file, "更新时间: {}", chrono::DateTime::<chrono::Local>::from(
-                SystemTime::UNIX_EPOCH + duration
-            ).format("%Y-%m-%d %H:%M:%S"))?;
-        }
-        writeln!(file)?;
-
-        if top_ips.is_empty() {
-            writeln!(file, "=== IP 流量统计（无数据） ===")?;
-            return Ok(());
-        }
-
-        writeln!(file, "=== IP 流量统计（TOP {}）===", top_ips.len())?;
-        writeln!(file, "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
-                 "排名", "IP 地址", "上传", "下载", "总流量", "连接数")?;
-        writeln!(file, "{}", "-".repeat(100))?;
-
-        for (i, snapshot) in top_ips.iter().enumerate() {
-            writeln!(
-                file,
-                "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
-                i + 1,
-                snapshot.ip,
-                format_bytes(snapshot.bytes_received),
-                format_bytes(snapshot.bytes_sent),
-                format_bytes(snapshot.total_bytes),
-                snapshot.connections
-            )?;
-        }
-
-        writeln!(file, "{}", "-".repeat(100))?;
-        writeln!(file, "当前跟踪 IP 数量: {}", total_count)?;
-
-        file.flush()?;
-        Ok(())
+    /// 把统计文件写入丢到阻塞线程池执行
+    fn spawn_write_to_file(&self, top_ips: Vec<IpTrafficSnapshot>, total_count: usize) {
+        let Some(path) = self.output_file.clone() else {
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = write_ip_traffic_file(&path, &top_ips, total_count) {
+                warn!("写入统计文件失败: {}", e);
+            }
+        });
     }
 
     /// 保存统计数据到持久化文件（JSON 格式）
     fn save_to_persistence_file_internal(&self, path: &str) -> std::io::Result<()> {
         use std::time::SystemTime;
 
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
         let mut stats_map = HashMap::new();
-        for (ip, stats) in inner.stats.iter() {
-            stats_map.insert(
-                ip.to_string(),
-                PersistedStats {
-                    bytes_received: stats.get_received(),
-                    bytes_sent: stats.get_sent(),
-                    connections: stats.get_connections(),
-                },
-            );
+        for shard in self.shards.iter() {
+            let inner = shard.stats.lock().unwrap_or_else(|e| e.into_inner());
+            for (ip, stats) in inner.iter() {
+                stats_map.insert(
+                    ip.to_string(),
+                    PersistedStats {
+                        bytes_received: stats.get_received(),
+                        bytes_sent: stats.get_sent(),
+                        connections: stats.get_connections(),
+                    },
+                );
+            }
         }
 
         let saved_at = SystemTime::now()
@@ -312,8 +302,6 @@ impl IpTrafficTracker {
             stats: stats_map,
             saved_at,
         };
-
-        drop(inner); // 释放锁
 
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -337,7 +325,6 @@ impl IpTrafficTracker {
         let data: PersistenceData = serde_json::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut loaded_count = 0;
 
         for (ip_str, persisted_stats) in data.stats {
@@ -347,12 +334,14 @@ impl IpTrafficTracker {
                     bytes_sent: AtomicU64::new(persisted_stats.bytes_sent),
                     connections: AtomicU64::new(persisted_stats.connections),
                 };
-                inner.stats.put(ip, stats);
+                self.shard_for(&ip)
+                    .stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(ip, stats);
                 loaded_count += 1;
             }
         }
-
-        drop(inner);
 
         info!("从持久化文件加载了 {} 个 IP 的统计数据 (保存于 {} 秒前)",
             loaded_count,
@@ -370,7 +359,10 @@ impl IpTrafficTracker {
         if !self.enabled {
             return 0;
         }
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).stats.len()
+        self.shards
+            .iter()
+            .map(|shard| shard.stats.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 
     /// 清空所有统计数据
@@ -378,8 +370,9 @@ impl IpTrafficTracker {
         if !self.enabled {
             return;
         }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.stats.clear();
+        for shard in self.shards.iter() {
+            shard.stats.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         info!("IP 流量统计已清空");
     }
 
@@ -428,6 +421,52 @@ struct PersistedStats {
     bytes_received: u64,
     bytes_sent: u64,
     connections: u64,
+}
+
+/// 写入 IP 流量统计文件（覆盖写入）
+///
+/// 独立成自由函数（不是 `IpTrafficTracker` 的方法）是为了方便在
+/// `spawn_blocking` 闭包里调用而不必克隆整个 tracker。
+fn write_ip_traffic_file(path: &str, top_ips: &[IpTrafficSnapshot], total_count: usize) -> std::io::Result<()> {
+    use std::time::SystemTime;
+
+    let mut file = File::create(path)?;
+
+    if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        writeln!(file, "更新时间: {}", chrono::DateTime::<chrono::Local>::from(
+            SystemTime::UNIX_EPOCH + duration
+        ).format("%Y-%m-%d %H:%M:%S"))?;
+    }
+    writeln!(file)?;
+
+    if top_ips.is_empty() {
+        writeln!(file, "=== IP 流量统计（无数据） ===")?;
+        return Ok(());
+    }
+
+    writeln!(file, "=== IP 流量统计（TOP {}）===", top_ips.len())?;
+    writeln!(file, "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
+             "排名", "IP 地址", "上传", "下载", "总流量", "连接数")?;
+    writeln!(file, "{}", "-".repeat(100))?;
+
+    for (i, snapshot) in top_ips.iter().enumerate() {
+        writeln!(
+            file,
+            "{:<4} {:<40} {:>12} {:>12} {:>12} {:>8}",
+            i + 1,
+            snapshot.ip,
+            format_bytes(snapshot.bytes_received),
+            format_bytes(snapshot.bytes_sent),
+            format_bytes(snapshot.total_bytes),
+            snapshot.connections
+        )?;
+    }
+
+    writeln!(file, "{}", "-".repeat(100))?;
+    writeln!(file, "当前跟踪 IP 数量: {}", total_count)?;
+
+    file.flush()?;
+    Ok(())
 }
 
 /// 格式化字节数为人类可读格式
@@ -528,5 +567,54 @@ mod tests {
 
         assert_eq!(tracker.get_tracked_count(), 0);
         assert!(tracker.get_stats(&ip).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_print_summary_writes_file_via_blocking_task() {
+        // print_summary 内部通过 spawn_blocking 异步写文件（不阻塞调用线程），
+        // 这里验证任务确实执行了、文件确实写出来了，而不只是编译通过。
+        let path = std::env::temp_dir().join(format!(
+            "sni_proxy_ip_traffic_test_{}.txt",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let tracker = IpTrafficTracker::new(100, Some(path_str), None);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        tracker.record_connection(ip);
+        tracker.record_sent(ip, 12345);
+
+        tracker.print_summary(10);
+
+        // spawn_blocking 是 fire-and-forget，给它一点时间跑完
+        for _ in 0..20 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let contents = std::fs::read_to_string(&path).expect("统计文件应已写入");
+        assert!(contents.contains("192.168.1.1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sharding_preserves_all_entries() {
+        // 多个不同 IP 分布在不同分片时，聚合类接口（get_all_stats/get_tracked_count/
+        // save 相关逻辑依赖的遍历）应仍然能看到所有条目，不因分片丢数据
+        let tracker = IpTrafficTracker::new(1000, None, None);
+        let ips: Vec<IpAddr> = (0..50)
+            .map(|i| format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap())
+            .collect();
+
+        for ip in &ips {
+            tracker.record_connection(*ip);
+        }
+
+        assert_eq!(tracker.get_tracked_count(), ips.len());
+        assert_eq!(tracker.get_all_stats().len(), ips.len());
     }
 }

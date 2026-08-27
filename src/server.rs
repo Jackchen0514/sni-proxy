@@ -17,7 +17,7 @@ use crate::ip_traffic::IpTrafficTracker;
 use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy::proxy_data;
 use crate::socks5::{connect_via_socks5, Socks5Config};
-use crate::tls::parse_sni;
+use crate::tls::{parse_sni, tls_record_total_len};
 
 /// SNI 代理服务器
 pub struct SniProxy {
@@ -175,30 +175,6 @@ impl SniProxy {
                     &reuse_port as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&reuse_port) as libc::socklen_t,
                 );
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                let fd = socket.as_raw_fd();
-                const TCP_FASTOPEN: libc::c_int = 23;
-                let queue_len: libc::c_int = 256;
-                let result = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    TCP_FASTOPEN,
-                    &queue_len as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&queue_len) as libc::socklen_t,
-                );
-
-                if result == 0 {
-                    info!("✅ TCP Fast Open 已启用（服务端模式，队列: {}）", queue_len);
-                } else {
-                    warn!("⚠️  TCP Fast Open 启用失败（系统可能不支持）");
-                    warn!("   提示: 检查 /proc/sys/net/ipv4/tcp_fastopen");
-                }
             }
         }
 
@@ -470,6 +446,46 @@ async fn handle_new_connection(
     });
 }
 
+/// 读取完整的 TLS ClientHello（第一个 TLS 记录）
+///
+/// 单次 `read()` 可能只拿到 ClientHello 的一部分（记录跨多个 TCP 段的情况，
+/// 常见于携带大量扩展的现代客户端），因此这里循环读取直到集齐记录头声明的
+/// 完整长度。记录长度上限由 [`MAX_TLS_RECORD_LEN`](crate::tls::MAX_TLS_RECORD_LEN)
+/// 校验，防止畸形/恶意声明长度导致无限增长；调用方应额外套一层整体超时防止慢速攻击。
+///
+/// 返回 `Ok(None)` 表示客户端在发送任何数据前就关闭了连接。
+async fn read_full_client_hello(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let mut first = true;
+
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            if first {
+                return Ok(None);
+            }
+            return Err(anyhow::anyhow!("客户端在发送完整 ClientHello 前关闭了连接"));
+        }
+        first = false;
+        buf.extend_from_slice(&chunk[..n]);
+
+        if buf.len() >= 5 {
+            match tls_record_total_len(&buf[..5]) {
+                Some(total_len) if buf.len() >= total_len => return Ok(Some(buf)),
+                Some(_) => {
+                    // 记录声明的长度合法，但还没读够，继续读取
+                }
+                None => {
+                    // 不是合法的握手记录起始（或声明长度超限）：
+                    // 不再继续读取，交给上层 parse_sni 判定并拒绝
+                    return Ok(Some(buf));
+                }
+            }
+        }
+    }
+}
+
 /// 处理单个客户端连接
 async fn handle_connection(
     mut client_stream: TcpStream,
@@ -509,14 +525,6 @@ async fn handle_connection(
     let _ = crate::proxy::optimize_tcp_for_streaming(&client_stream);
 
     let num_cpus = num_cpus::get();
-    let buffer_size = if num_cpus <= 2 {
-        16384
-    } else if num_cpus <= 8 {
-        32768
-    } else {
-        65536
-    };
-    let mut buffer = vec![0u8; buffer_size];
 
     let read_timeout_secs = if num_cpus <= 2 {
         2
@@ -527,8 +535,15 @@ async fn handle_connection(
     };
 
     let read_start = Instant::now();
-    let n = match timeout(Duration::from_secs(read_timeout_secs), client_stream.read(&mut buffer)).await {
-        Ok(Ok(n)) => n,
+    let buffer = match timeout(
+        Duration::from_secs(read_timeout_secs),
+        read_full_client_hello(&mut client_stream),
+    ).await {
+        Ok(Ok(Some(buf))) => buf,
+        Ok(Ok(None)) => {
+            debug!("客户端连接已关闭");
+            return Ok(());
+        }
         Ok(Err(e)) => {
             warn!("读取客户端数据失败: {}", e);
             metrics.inc_failed_connections();
@@ -542,12 +557,6 @@ async fn handle_connection(
         }
     };
 
-    if n == 0 {
-        debug!("客户端连接已关闭");
-        return Ok(());
-    }
-
-    buffer.truncate(n);
     debug!("⏱️  读取 Client Hello 耗时: {:?}", read_start.elapsed());
 
     // 解析 SNI
@@ -632,29 +641,52 @@ async fn handle_connection(
             8
         };
 
-        // 使用 .first() 防止空列表 panic
-        let first_ip = match resolved_ips.first() {
-            Some(ip) => *ip,
+        if resolved_ips.is_empty() {
+            error!("DNS 解析返回空 IP 列表: {}", sni);
+            metrics.inc_failed_connections();
+            return Ok(());
+        }
+
+        // 最多尝试前 3 个候选 IP（Happy-Eyeballs 式故障转移），
+        // 单个候选无响应/被拒时不必让整个连接失败，把总超时预算分摊到各次尝试上
+        let candidates: Vec<_> = resolved_ips.iter().take(3).copied().collect();
+        let per_attempt_timeout = (Duration::from_secs(connect_timeout_secs) / candidates.len() as u32)
+            .max(Duration::from_secs(1));
+
+        let mut connected_stream = None;
+        let mut last_err = String::new();
+        let mut last_was_timeout = false;
+
+        for ip in &candidates {
+            let target_addr = (*ip, 443);
+            match timeout(per_attempt_timeout, TcpStream::connect(target_addr)).await {
+                Ok(Ok(stream)) => {
+                    connected_stream = Some(stream);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    debug!("连接到候选 IP {}:443（{}）失败: {}，尝试下一个候选", ip, sni, e);
+                    last_err = e.to_string();
+                    last_was_timeout = false;
+                }
+                Err(_) => {
+                    debug!("连接到候选 IP {}:443（{}）超时（{:?}），尝试下一个候选", ip, sni, per_attempt_timeout);
+                    last_err = "连接超时".to_string();
+                    last_was_timeout = true;
+                }
+            }
+        }
+
+        match connected_stream {
+            Some(stream) => stream,
             None => {
-                error!("DNS 解析返回空 IP 列表: {}", sni);
-                metrics.inc_failed_connections();
-                return Ok(());
-            }
-        };
-        let target_addr = (first_ip, 443);
-        match timeout(
-            Duration::from_secs(connect_timeout_secs),
-            TcpStream::connect(target_addr)
-        ).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                error!("连接到目标服务器 {}:{} 失败: {}", first_ip, 443, e);
-                metrics.inc_failed_connections();
-                return Ok(());
-            }
-            Err(_) => {
-                error!("连接到目标服务器 {}:{} 超时", first_ip, 443);
-                metrics.inc_connection_timeouts();
+                error!(
+                    "连接到目标服务器 {} 失败，已尝试 {} 个候选 IP {:?}，最后错误: {}",
+                    sni, candidates.len(), candidates, last_err
+                );
+                if last_was_timeout {
+                    metrics.inc_connection_timeouts();
+                }
                 metrics.inc_failed_connections();
                 return Ok(());
             }

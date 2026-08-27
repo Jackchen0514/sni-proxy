@@ -1,3 +1,23 @@
+/// TLS 明文记录最大长度（RFC 8446 §5.1），用于校验记录头声明的长度是否合法
+pub const MAX_TLS_RECORD_LEN: usize = 16384;
+
+/// 根据 TLS 记录头（至少 5 字节：类型 1B + 版本 2B + 长度 2B）计算记录总长度（含头部）。
+///
+/// 返回 `None` 表示这不是一个合法的握手记录起始（类型/版本不对，或声明长度超出
+/// RFC 8446 允许的最大明文记录长度，可能是非 TLS 流量或畸形/恶意数据）。
+/// 调用方据此判断是否需要继续读取更多字节以凑齐完整记录。
+#[inline]
+pub fn tls_record_total_len(header: &[u8]) -> Option<usize> {
+    if header.len() < 5 || header[0] != 0x16 || header[1] != 0x03 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if payload_len > MAX_TLS_RECORD_LEN {
+        return None;
+    }
+    Some(5 + payload_len)
+}
+
 /// 从 TLS Client Hello 中解析 SNI（优化版本）
 #[inline]
 pub fn parse_sni(data: &[u8]) -> Option<String> {
@@ -189,6 +209,23 @@ fn is_valid_sni_hostname(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tls_record_total_len() {
+        // 太短，无法判断
+        assert_eq!(tls_record_total_len(&[0x16, 0x03]), None);
+        // 非握手类型
+        assert_eq!(tls_record_total_len(&[0x17, 0x03, 0x01, 0x00, 0x10]), None);
+        // 非法版本主版本号
+        assert_eq!(tls_record_total_len(&[0x16, 0x02, 0x01, 0x00, 0x10]), None);
+        // 合法：声明 payload 长度 0x0010 = 16
+        assert_eq!(
+            tls_record_total_len(&[0x16, 0x03, 0x01, 0x00, 0x10]),
+            Some(21)
+        );
+        // 声明长度超过 RFC 8446 上限，判定为非法
+        assert_eq!(tls_record_total_len(&[0x16, 0x03, 0x01, 0xff, 0xff]), None);
+    }
 
     #[test]
     fn test_parse_sni() {

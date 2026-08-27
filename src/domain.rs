@@ -63,10 +63,22 @@ impl DomainMatcher {
             return true;
         }
 
-        let domain_lower = domain.to_lowercase();
+        // SNI 主机名（来自 parse_sni，已校验为纯 ASCII）绝大多数情况下客户端
+        // 发送时就是小写。这里先扫一遍判断是否已经全小写，是的话直接用 &str
+        // 比较，避免每次连接都 to_lowercase() 分配一份新 String；只有真的
+        // 包含大写字母时才退化为分配一次。
+        if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            let domain_lower = domain.to_lowercase();
+            self.matches_lowercase(&domain_lower)
+        } else {
+            self.matches_lowercase(domain)
+        }
+    }
 
+    #[inline]
+    fn matches_lowercase(&self, domain_lower: &str) -> bool {
         // 先检查精确匹配（O(1)）
-        if self.exact_domains.contains(&domain_lower) {
+        if self.exact_domains.contains(domain_lower) {
             return true;
         }
 

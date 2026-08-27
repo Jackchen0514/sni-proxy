@@ -8,61 +8,16 @@ use crate::metrics::Metrics;
 
 /// 优化 TCP socket 参数（流媒体专用）
 ///
-/// - 更大的接收/发送缓冲区 (1MB)
 /// - TCP_NODELAY 禁用 Nagle 算法减少延迟
-/// - TCP Fast Open 减少握手延迟（Linux 客户端模式）
+///
+/// 注意：不再手动设置 SO_RCVBUF/SO_SNDBUF。之前固定设为 1MB，
+/// 在大量并发连接下（客户端+目标两侧 socket 各占一份）会强制预留
+/// 远超实际需要的内核缓冲区，且绕过了 Linux 默认的自动调优
+/// （会根据实际吞吐动态伸缩），高并发时反而增加内存压力、损害延迟稳定性。
+/// 交给内核自动调优即可。
 pub fn optimize_tcp_for_streaming(stream: &TcpStream) -> Result<()> {
     // 设置 TCP_NODELAY（禁用 Nagle 算法，减少延迟）
     let _ = stream.set_nodelay(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-
-        unsafe {
-            // 设置接收缓冲区为 1MB（流媒体需要大缓冲）
-            let rcvbuf_size: libc::c_int = 1024 * 1024; // 1MB
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &rcvbuf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // 设置发送缓冲区为 1MB
-            let sndbuf_size: libc::c_int = 1024 * 1024; // 1MB
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &sndbuf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // ⚡ 启用 TCP Fast Open（客户端模式）
-            // Linux 3.13+ 支持，节省 1 RTT
-            #[cfg(target_os = "linux")]
-            {
-                const TCP_FASTOPEN_CONNECT: libc::c_int = 30; // Linux 特定常量
-                let enable: libc::c_int = 1;
-                let result = libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    TCP_FASTOPEN_CONNECT,
-                    &enable as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-
-                if result == 0 {
-                    debug!("✅ TCP Fast Open 已启用（客户端模式）");
-                } else {
-                    debug!("⚠️  TCP Fast Open 启用失败（可能系统不支持）");
-                }
-            }
-        }
-    }
 
     Ok(())
 }
