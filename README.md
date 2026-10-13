@@ -149,6 +149,10 @@ cargo run --release -- config.json
 
 **`ip_whitelist` 格式**：单个 IP（`"192.168.1.1"`、`"::1"`）或 CIDR 网段（`"10.0.0.0/8"`、`"2001:db8::/32"`），IPv4/IPv6 均可。
 
+**`socks5`**：
+- `addr`：SOCKS5 服务器地址，支持 `ip:port`、`[ipv6]:port` 或 `域名:port`（如 `"my.ddns.net:1080"`，可用 DDNS 域名）。域名不在启动时固定，而是连接时解析，结果缓存 60 秒；连接失败会立即清掉缓存，下次连接重新解析，所以 DDNS 的 IP 变了之后最多 60 秒就会生效
+- `username` / `password`：用户名/密码认证，两者要么都填，要么都为 `null`
+
 **`ip_traffic_tracking`**（记录每个白名单内 IP 的连接数/上传/下载流量）：
 
 ```json

@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     // 示例 2: 使用 SOCKS5 无认证
     println!("=== 示例 2: 使用 SOCKS5（无认证）===\n");
     let socks5_config = Socks5Config {
-        addr: "127.0.0.1:1080".parse()?,
+        addr: "127.0.0.1:1080".to_string(),
         username: None,
         password: None,
     };
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         "github.com".to_string(),
     ]);
     let socks5_config = Socks5Config {
-        addr: "proxy.example.com:1080".parse()?,
+        addr: "proxy.example.com:1080".to_string(),
         username: Some("myuser".to_string()),
         password: Some("mypassword".to_string()),
     };

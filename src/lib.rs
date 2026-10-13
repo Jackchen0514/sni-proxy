@@ -21,5 +21,5 @@ pub use logger::{init_default_logger, init_from_env, init_logger, LogConfig, Log
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use proxy::proxy_data;
 pub use server::SniProxy;
-pub use socks5::{connect_via_socks5, Socks5Config};
+pub use socks5::{connect_via_socks5, validate_socks5_addr, Socks5Config};
 pub use tls::parse_sni;

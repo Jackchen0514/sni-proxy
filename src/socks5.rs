@@ -1,7 +1,10 @@
 use anyhow::Result;
-use log::{debug, info};
+use lazy_static::lazy_static;
+use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -9,15 +12,95 @@ use tokio::time::timeout;
 /// SOCKS5 握手各阶段统一 I/O 超时
 const SOCKS5_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// SOCKS5 服务器域名解析结果的缓存时长
+///
+/// 比通用 DNS 缓存短，DDNS 地址变化后最多这么久就会生效；
+/// 连接失败时会立即清掉缓存，下次连接重新解析。
+const SOCKS5_ADDR_CACHE_TTL: Duration = Duration::from_secs(60);
+
+lazy_static! {
+    // SOCKS5 服务器地址 -> (解析结果, 解析时间)
+    static ref SOCKS5_ADDR_CACHE: Mutex<HashMap<String, (Vec<SocketAddr>, Instant)>> =
+        Mutex::new(HashMap::new());
+}
+
 /// SOCKS5 代理配置
 #[derive(Debug, Clone)]
 pub struct Socks5Config {
-    /// SOCKS5 代理服务器地址
-    pub addr: SocketAddr,
+    /// SOCKS5 代理服务器地址，格式：`ip:port`、`[ipv6]:port` 或 `domain:port`
+    ///
+    /// 域名在每次连接时解析（带短时缓存），因此支持 DDNS
+    pub addr: String,
     /// 用户名（可选）
     pub username: Option<String>,
     /// 密码（可选）
     pub password: Option<String>,
+}
+
+/// 校验 SOCKS5 服务器地址格式（只检查格式，不做 DNS 解析）
+pub fn validate_socks5_addr(addr: &str) -> Result<()> {
+    if addr.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("缺少端口号，格式应为 host:port"))?;
+    if host.is_empty() || host.contains(':') {
+        return Err(anyhow::anyhow!("无效的主机名: {}", host));
+    }
+    port.parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("无效的端口号: {}", port))?;
+    Ok(())
+}
+
+/// 解析 SOCKS5 服务器地址：IP 直接返回，域名走短时缓存
+async fn resolve_socks5_addr(addr: &str) -> Result<Vec<SocketAddr>> {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return Ok(vec![socket_addr]);
+    }
+
+    if let Some((addrs, resolved_at)) = SOCKS5_ADDR_CACHE.lock().unwrap().get(addr) {
+        if resolved_at.elapsed() < SOCKS5_ADDR_CACHE_TTL {
+            return Ok(addrs.clone());
+        }
+    }
+
+    let addrs: Vec<SocketAddr> = match timeout(SOCKS5_IO_TIMEOUT, tokio::net::lookup_host(addr)).await {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(e)) => return Err(anyhow::anyhow!("解析 SOCKS5 服务器地址 {} 失败: {}", addr, e)),
+        Err(_) => return Err(anyhow::anyhow!("解析 SOCKS5 服务器地址 {} 超时", addr)),
+    };
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("SOCKS5 服务器地址 {} 解析结果为空", addr));
+    }
+
+    debug!("SOCKS5 服务器地址解析: {} -> {:?}", addr, addrs);
+    SOCKS5_ADDR_CACHE
+        .lock()
+        .unwrap()
+        .insert(addr.to_string(), (addrs.clone(), Instant::now()));
+    Ok(addrs)
+}
+
+/// 依次尝试解析出的每个地址，全部失败时清掉缓存，下次连接重新解析
+async fn connect_socks5_server(addr: &str) -> Result<TcpStream> {
+    let mut last_err = None;
+    for socket_addr in resolve_socks5_addr(addr).await? {
+        match timeout(SOCKS5_IO_TIMEOUT, TcpStream::connect(socket_addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                last_err = Some(anyhow::anyhow!("无法连接到 SOCKS5 服务器 {} ({}): {}", addr, socket_addr, e));
+            }
+            Err(_) => {
+                last_err = Some(anyhow::anyhow!("连接到 SOCKS5 服务器 {} ({}) 超时", addr, socket_addr));
+            }
+        }
+    }
+
+    if SOCKS5_ADDR_CACHE.lock().unwrap().remove(addr).is_some() {
+        warn!("SOCKS5 服务器 {} 连接失败，已清除地址缓存", addr);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("无法连接到 SOCKS5 服务器 {}", addr)))
 }
 
 /// 优化的 SOCKS5 连接函数
@@ -39,18 +122,7 @@ pub async fn connect_via_socks5(
     info!("通过 SOCKS5 连接到 {}:{}", target_host, target_port);
 
     // ============ 步骤 1: 连接到 SOCKS5 服务器 ============
-    let mut socks5_stream = match timeout(
-        SOCKS5_IO_TIMEOUT,
-        TcpStream::connect(&socks5_config.addr)
-    ).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            return Err(anyhow::anyhow!("无法连接到 SOCKS5 服务器 {}: {}", socks5_config.addr, e));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!("连接到 SOCKS5 服务器 {} 超时", socks5_config.addr));
-        }
-    };
+    let mut socks5_stream = connect_socks5_server(&socks5_config.addr).await?;
 
     let _ = socks5_stream.set_nodelay(true);
 
@@ -283,4 +355,34 @@ pub async fn connect_via_socks5(
 
     info!("✅ 通过 SOCKS5 成功连接到 {}:{}", target_host, target_port);
     Ok(socks5_stream)
+}
+
+#[cfg(test)]
+mod addr_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_socks5_addr() {
+        assert!(validate_socks5_addr("127.0.0.1:1080").is_ok());
+        assert!(validate_socks5_addr("[::1]:1080").is_ok());
+        assert!(validate_socks5_addr("my.ddns.net:1080").is_ok());
+        assert!(validate_socks5_addr("localhost:1080").is_ok());
+
+        assert!(validate_socks5_addr("my.ddns.net").is_err());
+        assert!(validate_socks5_addr(":1080").is_err());
+        assert!(validate_socks5_addr("my.ddns.net:abc").is_err());
+        assert!(validate_socks5_addr("my.ddns.net:70000").is_err());
+        assert!(validate_socks5_addr("::1:1080").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_socks5_addr() {
+        let addrs = resolve_socks5_addr("127.0.0.1:1080").await.unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:1080".parse().unwrap()]);
+
+        let addrs = resolve_socks5_addr("localhost:1080").await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.port() == 1080 && a.ip().is_loopback()));
+        assert!(SOCKS5_ADDR_CACHE.lock().unwrap().contains_key("localhost:1080"));
+    }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sni_proxy::logger::{init_logger, LogConfig, LogLevel};
-use sni_proxy::{SniProxy, Socks5Config};
+use sni_proxy::{validate_socks5_addr, SniProxy, Socks5Config};
 use std::fs;
 use std::net::SocketAddr;
 
@@ -146,10 +146,7 @@ fn validate_config(config: &Config) -> Result<()> {
 
     // 验证 SOCKS5 配置
     if let Some(ref socks5) = config.socks5 {
-        socks5
-            .addr
-            .parse::<SocketAddr>()
-            .context("无效的 SOCKS5 代理地址格式")?;
+        validate_socks5_addr(&socks5.addr).context("无效的 SOCKS5 代理地址格式")?;
 
         // 检查用户名和密码的一致性
         if socks5.username.is_some() != socks5.password.is_some() {
@@ -477,12 +474,7 @@ async fn async_main() -> Result<()> {
     if let Some(socks5_config_file) = config.socks5 {
         log::info!("配置 SOCKS5 代理");
 
-        // 解析 SOCKS5 地址
-        let socks5_addr: SocketAddr = socks5_config_file
-            .addr
-            .parse()
-            .context("无效的 SOCKS5 代理地址")?;
-
+        let socks5_addr = socks5_config_file.addr;
         log::info!("SOCKS5 代理服务器: {}", socks5_addr);
 
         if socks5_config_file.username.is_some() {
