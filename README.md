@@ -141,6 +141,12 @@ cargo run --release -- config.json
 - `"*.example.com"` — 匹配 `example.com` 的所有子域名（不含 `example.com` 本身）
 - `"*"` — 匹配所有域名
 
+**两个白名单的优先级**：先查 `socks5_whitelist`，命中就走 SOCKS5；没命中再查 `whitelist`，命中就直连；都没命中则拒绝连接。
+- 同一个域名同时出现在两个列表里时，走 SOCKS5
+- 通配符也按这个顺序：例如 `whitelist` 有 `"*.example.com"`、`socks5_whitelist` 有 `"api.example.com"`，则 `api.example.com` 走 SOCKS5，其余子域名直连
+- `socks5_whitelist` 里写了 `"*"` 时，所有域名都走 SOCKS5，`whitelist` 不再生效
+- 配置了 `socks5_whitelist` 却没有配置 `socks5` 时，命中的域名会改为直连（启动时会打印警告）
+
 **`ip_whitelist` 格式**：单个 IP（`"192.168.1.1"`、`"::1"`）或 CIDR 网段（`"10.0.0.0/8"`、`"2001:db8::/32"`），IPv4/IPv6 均可。
 
 **`ip_traffic_tracking`**（记录每个白名单内 IP 的连接数/上传/下载流量）：
