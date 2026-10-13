@@ -2,7 +2,7 @@
 
 一个用 Rust 编写的高性能 SNI (Server Name Indication) 代理服务器：不解密 TLS 流量，只读取 ClientHello 里的 SNI 字段做域名白名单过滤和转发。
 
-当前版本 **v2.1.1**。
+当前版本 **v2.1.2**。
 
 ## 功能特性
 
